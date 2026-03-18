@@ -38,12 +38,19 @@ Projeto utilizado para análise:
 Dependências completas:
 
 et_xmlfile==2.0.0
+
 numpy==2.4.3
+
 openpyxl==3.1.5
+
 pandas==3.0.1
+
 python-dateutil==2.9.0.post0
+
 python-dotenv==1.2.2
+
 six==1.17.0
+
 tzdata==2025.3
 
 
@@ -53,11 +60,17 @@ tzdata==2025.3
 
 
 projeto/
+
 │
+
 ├── main.py
+
 ├── .env
+
 ├── requirements.txt
+
 ├── README.md
+
 └── resultado_comparacao.xlsx (gerado automaticamente)
 
 
@@ -69,7 +82,9 @@ Crie um arquivo `.env` na raiz do projeto:
 
 
 ARQ_EXCEL=caminho/do/arquivo.xlsx
+
 SHEET_NAME=nome_da_aba
+
 RELATORIO_SAIDA=resultado_comparacao.xlsx
 
 
@@ -143,7 +158,7 @@ O script gera um arquivo Excel contendo:
 
 MathGriBe (Matheus Bevilaqua)  
 
-- 🔗 LinkedIn: https://linkedin.com/in/seu-link
-- 💻 GitHub: https://github.com/seu-user
+- 🔗 LinkedIn: https://www.linkedin.com/in/matheus-grisostomo-bevilaqua/
+- 💻 GitHub: https://github.com/MathGriBe
 
 Projeto desenvolvido para automação e análise de dados internos.
