@@ -141,4 +141,9 @@ O script gera um arquivo Excel contendo:
 
 ## 👨‍💻 Autor
 
+MathGriBe (Matheus Bevilaqua)  
+
+- 🔗 LinkedIn: https://linkedin.com/in/seu-link
+- 💻 GitHub: https://github.com/seu-user
+
 Projeto desenvolvido para automação e análise de dados internos.
