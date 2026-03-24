@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  automacao-python-conferencia:
+    build:
+    container_name: automacao-python-conferencia
+    environment:
+      EMAIL_REMETENTE: ${EMAIL_REMETENTE}
+      EMAIL_SENHA: ${EMAIL_SENHA}
+      EMAIL_DESTINATARIO: ${EMAIL_DESTINATARIO}
+      SMTP_SERVIDOR: ${SMTP_SERVIDOR}
+      SMTP_PORTA: ${SMTP_PORTA}
+    restart: "no"

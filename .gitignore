@@ -1,4 +1,16 @@
-.venv
-.env
-__pycache__
+# Ambiente virtual
+.venv/
+venv/
+
+# Arquivos de log
 *.log
+
+# Arquivos temporários
+__pycache__/
+*.pyc
+
+# Arquivos .env 
+.env
+
+# Arquivos gerados
+Relatorio_Divergencias_*.xlsx

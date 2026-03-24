@@ -1,164 +1,60 @@
-# 📊 Automação de Comparação de Dados
+📊 Automação de Conciliação de Serviços
 
-## 📌 Visão Geral
-Este projeto consiste em um script em Python responsável por comparar dados de clientes entre duas bases (ou dois lados da mesma planilha), validando inconsistências e gerando relatórios automáticos.
+📌 Visão Geral
+Script em Python responsável pela comparação entre Serviços Ativos (SA), Serviços x Sites (SS) e Dici (Base do XCONN):
 
-Projeto utilizado para análise:
-**Analise-Banda_CLI-PILOTO**
+DICI
+Serviços Ativos
+Sites (SharePoint sincronizado via OneDrive)
 
----
+O processo realiza:
+- Validação de existência dos serviços nas bases
+- Comparação de capacidade (DICI x Ativos)
 
-## ⚙️ O que o processo realiza?
+⚠ Identificação de divergências
+- Geração de relatório Excel com múltiplas abas 
+- Envio automático de e-mail (quando há divergências)
+- Registro de execução em log
 
-- 🔍 Validação de dados:
-  - Cliente
-  - Circuito
-  - Sigla
-
-- ⚠️ Identificação de divergências:
-  - Dados diferentes entre as bases
-  - Registros não encontrados
-
-- 📊 Geração de relatório em Excel:
-  - Base completa
-  - Divergências
-  - Registros válidos (OK)
-
-- 📝 Registro de logs (execução e erros)
-
----
-
-## 🛠️ Tecnologias utilizadas
-
-- Python 3.x
+🛠 Tecnologias Utilizadas
+- Python 3.12
 - pandas
 - openpyxl
 - python-dotenv
-
-Dependências completas:
-
-et_xmlfile==2.0.0
-
-numpy==2.4.3
-
-openpyxl==3.1.5
-
-pandas==3.0.1
-
-python-dateutil==2.9.0.post0
-
-python-dotenv==1.2.2
-
-six==1.17.0
-
-tzdata==2025.3
+- SMTP (Office365)
 
 
----
-
-## 📁 Estrutura do Projeto
-
-
-projeto/
-
+Estrutura do Projeto:
+automacao-servicos/
 │
-
-├── main.py
-
-├── .env
-
+├── automacao_comparacao.py
 ├── requirements.txt
-
 ├── README.md
+├── .gitignore
+└── .env (não versionado)
 
-└── resultado_comparacao.xlsx (gerado automaticamente)
-
-
----
-
-## 🔐 Variáveis de Ambiente
-
-Crie um arquivo `.env` na raiz do projeto:
-
-
-ARQ_EXCEL=caminho/do/arquivo.xlsx
-
-SHEET_NAME=nome_da_aba
-
-RELATORIO_SAIDA=resultado_comparacao.xlsx
-
-
-### ⚠️ Importante
-O arquivo `.env` **não deve ser versionado**.
-
-Adicione ao `.gitignore`:
-
-
-.env
-.venv
-
-
----
-
-## ▶️ Como executar
-
-1. Ativar o ambiente virtual:
-
-
+⚙️ Configuração do Ambiente
+1️⃣ Criar ambiente virtual
+py -3.12 -m venv .venv
+2️⃣ Ativar ambiente (Windows)
 .venv\Scripts\activate
-
-
-2. Instalar dependências:
-
-
+3️⃣ Instalar dependências
 pip install -r requirements.txt
 
 
-3. Executar o script:
+⚠ O arquivo .env não deve ser versionado.
 
 
-python main.py
+▶ Execução
+python automacao_comparacao.py
 
+📊 Saída Gerada
+O relatório Excel contém as seguintes abas:
+- Divergencias
+- So_no_Sites
+- So_no_DICI
+- So_no_Ativos
 
----
-
-## 📊 Saída gerada
-
-O script gera um arquivo Excel contendo:
-
-- 📄 Base_Comparacao → dados completos
-- ⚠️ Divergencias → inconsistências encontradas
-- ✅ OK → registros válidos
-- 🔍 Outros (dependendo do cenário):
-  - Não encontrados
-  - Duplicados
-
----
-
-## 🧠 Regras de comparação
-
-- Comparação baseada na coluna **Circuito**
-- Validação dos campos:
-  - Cliente
-  - Sigla
-
----
-
-## 🚀 Possíveis melhorias futuras
-
-- Integração com SharePoint
-- Execução automatizada (agendador / Docker)
-- Interface gráfica
-- Validação de múltiplas tabelas
-- Alertas por e-mail
-
----
-
-## 👨‍💻 Autor
-
-MathGriBe (Matheus Bevilaqua)  
-
-- 🔗 LinkedIn: https://www.linkedin.com/in/matheus-grisostomo-bevilaqua/
-- 💻 GitHub: https://github.com/MathGriBe
-
-Projeto desenvolvido para automação e análise de dados internos.
+Também são gerados:
+Arquivo de log (automacao_servicos.log)
+Envio automático de e-mail quando houver divergências
