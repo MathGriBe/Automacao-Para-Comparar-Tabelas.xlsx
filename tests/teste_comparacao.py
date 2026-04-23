@@ -27,7 +27,7 @@ ARQ_ATIVOS = os.getenv(
 )
 ARQ_SITES = os.getenv(
     "ARQ_SITES",
-    r"\\gjas-fileserver\Global\CORe\Automacoes\Guilherme Luis Dias De Oliveira - Controle de Implantação\Serviços x sites_base Junho_24 1.xlsx",
+    r"C:\Users\mbevilaqua\Eletronet SA\Guilherme Luis Dias De Oliveira - Controle de Implantação\Serviços x sites_base Junho_24 1.xlsx",
 )
 
 RELATORIO_SAIDA = os.getenv(
@@ -37,8 +37,8 @@ RELATORIO_SAIDA = os.getenv(
 
 LOG_ARQUIVO = "automacao_servicos.log"
 
-SHEET_ATIVOS_IP = os.getenv("SHEET_ATIVOS_IP", "Mar_26_IP")
-SHEET_ATIVOS_TRANS = os.getenv("SHEET_ATIVOS_TRANS", "Mar_26_Transp")
+SHEET_ATIVOS_IP = os.getenv("SHEET_ATIVOS_IP", "Abr_26_IP")
+SHEET_ATIVOS_TRANS = os.getenv("SHEET_ATIVOS_TRANS", "Abr_26_Transp")
 SHEET_SITES = os.getenv("SHEET_SITES", "Planilha1")
 
 HEADER_ATIVOS = int(os.getenv("HEADER_ATIVOS", "2"))
