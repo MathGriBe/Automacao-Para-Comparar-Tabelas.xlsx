@@ -21,7 +21,7 @@ Automacao em Python para conciliar servicos entre tres bases operacionais, ident
 
 O projeto compara dados de servicos presentes em tres fontes:
 
-- DICI
+- Lista Servicos Ativos CS (visualizador)
 - planilha de Servicos Ativos
 - base de Sites
 
@@ -60,12 +60,12 @@ Durante o processamento, a automacao:
 
 ```text
 .
-|-- automacao-comparacao.py
-|-- teste_comparacao.py
+|-- main.py
+|-- tests/
+|   |--> teste_comparacao.py
 |-- requirements.txt
 |-- Dockerfile
 |-- docker-compose.yml
-|-- tests/
 `-- README.md
 ```
 
@@ -89,16 +89,17 @@ EMAIL_DESTINATARIO=destinatario@empresa.com
 SMTP_SERVIDOR=smtp.office365.com
 SMTP_PORTA=587
 
-ARQ_DICI=C:\caminho\para\Relatorio_Dici_BD.xlsx
+ARQ_DICI=C:\caminho\para\Lista_Servicos_Ativos_CS.xlsx
 ARQ_ATIVOS=C:\caminho\para\Servicos_Ativos.xlsx
 ARQ_SITES=C:\caminho\para\Servicos_x_Sites.xlsx
 
-SHEET_DICI_IP=Relatorio_IP
-SHEET_DICI_TRANS=Relatorio_Trans
-SHEET_ATIVOS_IP=Mar_26_IP
-SHEET_ATIVOS_TRANS=Mar_26_Transp
+(Para acessar as abas das planilhas excel)
+SHEET_DICI = vw_Servicos_Ativos_CS
+SHEET_ATIVOS_IP= "mês"_"ano"_IP
+SHEET_ATIVOS_TRANS="mês"_"ano"_Transp
 SHEET_SITES=Planilha1
 
+(Linha para acessar as informações)
 HEADER_ATIVOS=2
 HEADER_SITES=2
 
@@ -151,16 +152,14 @@ O script gera:
 - um arquivo de log chamado `automacao_servicos.log`
 - um e-mail com o relatorio em anexo quando `ENVIAR_EMAIL=True` e existirem divergencias
 
-As abas do relatorio incluem:
+As colunas do relatorio incluem:
 
-- `Divergencias`
-- `Capacidade_Divergente`
-- `Nao_no_Sites`
-- `Nao_no_DICI`
-- `Nao_no_Ativos`
-- `Duplicados_Sites`
-- `Duplicados_DICI`
-- `Duplicados_Ativos`
+- `NomeServiço`
+- `Tipo de Serviço do XCONN`
+- `Existe_ServiçosxSites`
+- `Gb_XCONN`
+- `Gb_ServiçosAtivos`
+- `Status`
 
 ## Variaveis de ambiente
 
@@ -175,8 +174,7 @@ As abas do relatorio incluem:
 | `ARQ_ATIVOS` | Sim | Caminho completo do arquivo de Servicos Ativos. |
 | `ARQ_SITES` | Sim | Caminho completo do arquivo de Sites. |
 | `RELATORIO_SAIDA` | Nao | Nome ou caminho do arquivo Excel de saida. |
-| `SHEET_DICI_IP` | Nao | Aba IP do arquivo DICI. |
-| `SHEET_DICI_TRANS` | Nao | Aba Transporte do arquivo DICI. |
+| `SHEET_DICI` | Nao | Aba do arquivo Lista_Servicos_Ativos. |
 | `SHEET_ATIVOS_IP` | Nao | Aba IP do arquivo de Ativos. |
 | `SHEET_ATIVOS_TRANS` | Nao | Aba Transporte do arquivo de Ativos. |
 | `SHEET_SITES` | Nao | Aba da base de Sites. |

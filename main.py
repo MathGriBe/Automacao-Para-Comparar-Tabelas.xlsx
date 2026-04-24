@@ -21,23 +21,23 @@ EMAIL_DESTINATARIO = os.getenv("EMAIL_DESTINATARIO", "")
 SMTP_SERVIDOR = os.getenv("SMTP_SERVIDOR", "smtp.office365.com")
 SMTP_PORTA = int(os.getenv("SMTP_PORTA", "587"))
 
-ARQ_DICI = os.getenv("ARQ_DICI", r"Z:\CORe\Automacoes\Lista_Servicos_Ativos_CS.xlsx")
-ARQ_ATIVOS = os.getenv("ARQ_ATIVOS", r"Z:\Customer Services\Serviços Ativos\Serviços Ativos - Eletronet - 2026.xlsx")
-ARQ_SITES = os.getenv("ARQ_SITES", r"C:\Users\mbevilaqua\Eletronet SA\Guilherme Luis Dias De Oliveira - Controle de Implantação\Serviços x sites_base Junho_24 1.xlsx")
+ARQ_DICI = os.path.normpath(os.getenv("ARQ_DICI", ""))
+ARQ_ATIVOS = os.path.normpath(os.getenv("ARQ_ATIVOS", ""))
+ARQ_SITES = os.path.normpath(os.getenv("ARQ_SITES", ""))
 
 RELATORIO_SAIDA = f"Relatorio_Divergencias_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 LOG_ARQUIVO = "automacao_servicos.log"
 
-SHEET_DICI = 'vw_Servicos_Ativos_CS'
-SHEET_ATIVOS_IP = 'Abr_26_IP'
-SHEET_ATIVOS_TRANS = 'Abr_26_Transp'
-SHEET_SITES = 'Planilha1'
+SHEET_DICI = os.getenv("SHEET_DICI", "vw_Servicos_Ativos_CS")
+SHEET_ATIVOS_IP = os.getenv("SHEET_ATIVOS_IP", "Abr_26_IP")
+SHEET_ATIVOS_TRANS = os.getenv("SHEET_ATIVOS_TRANS", "Abr_26_Transp")
+SHEET_SITES = os.getenv("SHEET_SITES", "Planilha1")
 
-HEADER_ATIVOS = 2
-HEADER_SITES = 2
+HEADER_ATIVOS = int(os.getenv("HEADER_ATIVOS", "2"))
+HEADER_SITES = int(os.getenv("HEADER_SITES", "2"))
 
-ENVIAR_EMAIL = False
+ENVIAR_EMAIL = True
 
 # =============================
 # LOG
@@ -180,10 +180,10 @@ def comparar(dici, ativos_ip, ativos_trans, sites):
 
         resultados.append({
             "Servico": row["NmServico"],
-            "Tipo": tipo,
-            "Gb_DICI": gb,
-            "Gb_Ativos": capacidade,
-            "Existe_Sites": existe_site,
+            "XCONN tipo de serviço": tipo,
+            "Existe_ServiçosxSites": existe_site,
+            "Gb_XCONN": gb,
+            "Gb_ServiçosAtivos": capacidade,
             "Status": status
         })
 
@@ -195,6 +195,39 @@ def gerar_relatorio(df):
     logger.info(f"Relatório gerado: {RELATORIO_SAIDA}")
 
 
+def enviar_email_com_relatorio(arquivo_anexo):
+    if not ENVIAR_EMAIL:
+        logger.info("Envio de e-mail desabilitado nas configurações.")
+        return
+
+    logger.info("Preparando envio de e-mail...")
+    
+    msg = EmailMessage()
+    msg["Subject"] = f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')}"
+    msg["From"] = EMAIL_REMETENTE
+    msg["To"] = EMAIL_DESTINATARIO
+    msg.set_content("Olá,\n\nSegue em anexo o relatório de divergências gerado pela automação.")
+
+    # Anexar o arquivo Excel
+    try:
+        with open(arquivo_anexo, "rb") as f:
+            msg.add_attachment(
+                f.read(),
+                maintype="application",
+                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=arquivo_anexo
+            )
+
+        # Conectar ao servidor e enviar
+        with smtplib.SMTP(SMTP_SERVIDOR, SMTP_PORTA) as server:
+            server.starttls()  # Segurança
+            server.login(EMAIL_REMETENTE, EMAIL_SENHA)
+            server.send_message(msg)
+            
+        logger.info("E-mail enviado com sucesso!")
+    except Exception as e:
+        logger.error(f"Erro ao enviar e-mail: {e}")
+
 # =============================
 # MAIN
 # =============================
@@ -203,10 +236,10 @@ def main():
     logger.info("Iniciando...")
 
     dici, ativos_ip, ativos_trans, sites = preparar_bases()
-
     resultado = comparar(dici, ativos_ip, ativos_trans, sites)
-
     gerar_relatorio(resultado)
+
+    enviar_email_com_relatorio(RELATORIO_SAIDA)
 
     logger.info("Finalizado.")
 
