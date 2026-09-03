@@ -4,6 +4,7 @@ import smtplib
 import unicodedata
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import formataddr
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ load_dotenv()
 EMAIL_REMETENTE = os.getenv("EMAIL_REMETENTE", "")
 EMAIL_SENHA = os.getenv("EMAIL_SENHA", "")
 EMAIL_DESTINATARIO = os.getenv("EMAIL_DESTINATARIO", "")
+EMAIL_NOME_REMETENTE = os.getenv("EMAIL_NOME_REMETENTE", "Matheus Bevilaqua")
 
 SMTP_SERVIDOR = os.getenv("SMTP_SERVIDOR", "smtp.office365.com")
 SMTP_PORTA = int(os.getenv("SMTP_PORTA", "587"))
@@ -309,19 +311,164 @@ def gerar_relatorio(df):
 
     logger.info(f"Relatório gerado: {RELATORIO_SAIDA} ({divergentes}/{total} divergências)")
 
+    return {
+        "total": total,
+        "ok": total - divergentes,
+        "divergentes": divergentes,
+        "tipos": _contar_tipos_divergencia(df),
+    }
 
-def enviar_email_com_relatorio(arquivo_anexo):
+
+def _contar_tipos_divergencia(df):
+    """Conta quantas vezes cada tipo de divergência aparece (um serviço pode ter vários)."""
+    tipos = {}
+    for status in df.loc[df["Status"] != "OK", "Status"]:
+        for item in str(status).split(";"):
+            item = item.strip()
+            if item:
+                tipos[item] = tipos.get(item, 0) + 1
+    return sorted(tipos.items(), key=lambda par: par[1], reverse=True)
+
+
+def _montar_corpo_email(stats):
+    """Retorna (texto_plano, html) para o e-mail do relatório."""
+    data_hoje = datetime.now().strftime("%d/%m/%Y")
+    total = stats["total"]
+    ok = stats["ok"]
+    div = stats["divergentes"]
+    pct = (div / total * 100) if total else 0
+
+    # ---- Versão texto (fallback) ----
+    linhas_txt = [
+        "Olá,",
+        "",
+        f"Segue em anexo o relatório de divergências gerado automaticamente em {data_hoje}.",
+        "",
+        "Resumo:",
+        f"  - Serviços analisados : {total}",
+        f"  - Serviços OK         : {ok}",
+        f"  - Com divergência     : {div} ({pct:.1f}%)",
+        "",
+    ]
+    if stats["tipos"]:
+        linhas_txt.append("Principais tipos de divergência:")
+        for nome, qtd in stats["tipos"][:8]:
+            linhas_txt.append(f"  - {nome}: {qtd}")
+        linhas_txt.append("")
+    linhas_txt += [
+        "O detalhamento serviço a serviço está na planilha anexa (aba 'Divergencias').",
+        "",
+        "Mensagem gerada automaticamente - favor não responder.",
+    ]
+    texto = "\n".join(linhas_txt)
+
+    # ---- Versão HTML ----
+    linhas_tipos_html = ""
+    for nome, qtd in stats["tipos"][:8]:
+        linhas_tipos_html += (
+            "<tr>"
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eaeaea;font-size:13px;color:#333;">{nome}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eaeaea;font-size:13px;color:#333;text-align:right;font-weight:bold;">{qtd}</td>'
+            "</tr>"
+        )
+    if not linhas_tipos_html:
+        linhas_tipos_html = (
+            '<tr><td colspan="2" style="padding:8px 12px;font-size:13px;color:#333;">'
+            "Nenhuma divergência encontrada nesta execução.</td></tr>"
+        )
+
+    html = f"""\
+<html>
+  <body style="margin:0;padding:0;background:#f4f5f7;font-family:Segoe UI,Arial,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;border:1px solid #e5e7eb;">
+            <tr>
+              <td style="background:#1f4e79;padding:20px 28px;">
+                <span style="color:#ffffff;font-size:18px;font-weight:bold;">Relatório de Divergências de Serviços</span><br>
+                <span style="color:#cfe0f0;font-size:13px;">{data_hoje}</span>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px 28px 8px 28px;font-size:14px;color:#333;line-height:1.5;">
+                Olá,<br><br>
+                Segue o resultado da comparação automática entre as bases (XCONN, Ativos IP/Transporte e Sites).
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:12px 28px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td width="33%" align="center" style="padding:12px;background:#f0f4f8;border-radius:6px;">
+                      <div style="font-size:22px;font-weight:bold;color:#1f4e79;">{total}</div>
+                      <div style="font-size:12px;color:#666;">Analisados</div>
+                    </td>
+                    <td width="4"></td>
+                    <td width="33%" align="center" style="padding:12px;background:#eef7ee;border-radius:6px;">
+                      <div style="font-size:22px;font-weight:bold;color:#2e7d32;">{ok}</div>
+                      <div style="font-size:12px;color:#666;">OK</div>
+                    </td>
+                    <td width="4"></td>
+                    <td width="33%" align="center" style="padding:12px;background:#fdecec;border-radius:6px;">
+                      <div style="font-size:22px;font-weight:bold;color:#c62828;">{div}</div>
+                      <div style="font-size:12px;color:#666;">Divergências ({pct:.1f}%)</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:20px 28px 8px 28px;font-size:14px;color:#333;font-weight:bold;">
+                Principais tipos de divergência
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 28px 16px 28px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eaeaea;border-radius:6px;">
+                  {linhas_tipos_html}
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:8px 28px 24px 28px;font-size:13px;color:#555;line-height:1.5;">
+                O detalhamento serviço a serviço está na planilha anexa, na aba <b>Divergencias</b>.
+              </td>
+            </tr>
+            <tr>
+              <td style="background:#f0f0f0;padding:14px 28px;font-size:11px;color:#888;">
+                Mensagem gerada automaticamente pela rotina de comparação de dados. Favor não responder.
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+    return texto, html
+
+
+def enviar_email_com_relatorio(arquivo_anexo, stats=None):
     if not ENVIAR_EMAIL:
         logger.info("Envio de e-mail desabilitado nas configurações.")
         return
 
     logger.info("Preparando envio de e-mail...")
 
+    stats = stats or {"total": 0, "ok": 0, "divergentes": 0, "tipos": []}
+    texto, html = _montar_corpo_email(stats)
+
     msg = EmailMessage()
-    msg["Subject"] = f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')}"
-    msg["From"] = EMAIL_REMETENTE
+    msg["Subject"] = (
+        f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')} "
+        f"({stats['divergentes']} divergência(s))"
+    )
+    msg["From"] = formataddr((EMAIL_NOME_REMETENTE, EMAIL_REMETENTE))
     msg["To"] = EMAIL_DESTINATARIO
-    msg.set_content("Olá,\n\nSegue em anexo o relatório de divergências gerado pela automação.")
+    msg.set_content(texto)
+    msg.add_alternative(html, subtype="html")
 
     try:
         with open(arquivo_anexo, "rb") as f:
@@ -352,9 +499,9 @@ def main():
 
     dici, ativos_ip, ativos_trans, sites = preparar_bases()
     resultado = comparar_bases(dici, ativos_ip, ativos_trans, sites)
-    gerar_relatorio(resultado)
+    stats = gerar_relatorio(resultado)
 
-    enviar_email_com_relatorio(RELATORIO_SAIDA)
+    enviar_email_com_relatorio(RELATORIO_SAIDA, stats)
 
     logger.info("Finalizado.")
 
