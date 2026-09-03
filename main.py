@@ -37,7 +37,7 @@ SHEET_SITES = os.getenv("SHEET_SITES", "Planilha1")
 HEADER_ATIVOS = int(os.getenv("HEADER_ATIVOS", "2"))
 HEADER_SITES = int(os.getenv("HEADER_SITES", "2"))
 
-ENVIAR_EMAIL = False
+ENVIAR_EMAIL = os.getenv("ENVIAR_EMAIL", "false").strip().lower() == "true"
 
 # Serviços que devem ser desconsiderados da análise
 FILTRO_SUBSTRING_IGNORAR = "ESCH"
@@ -104,6 +104,19 @@ def ler_arquivo_excel(caminho, sheet_name, header=None):
 # =============================
 # PROCESSAMENTO
 # =============================
+
+def validar_caminhos():
+    for nome, caminho in [
+        ("ARQ_DICI", ARQ_DICI),
+        ("ARQ_ATIVOS", ARQ_ATIVOS),
+        ("ARQ_SITES", ARQ_SITES),
+    ]:
+        if not caminho or not os.path.isfile(caminho):
+            raise FileNotFoundError(
+                f"{nome} inválido ou não encontrado: {caminho!r}. "
+                f"Verifique o arquivo .env."
+            )
+
 
 def preparar_bases():
     logger.info("Lendo arquivos...")
@@ -316,7 +329,7 @@ def enviar_email_com_relatorio(arquivo_anexo):
                 f.read(),
                 maintype="application",
                 subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                filename=arquivo_anexo
+                filename=os.path.basename(arquivo_anexo)
             )
 
         with smtplib.SMTP(SMTP_SERVIDOR, SMTP_PORTA) as server:
@@ -334,6 +347,8 @@ def enviar_email_com_relatorio(arquivo_anexo):
 
 def main():
     logger.info("Iniciando...")
+
+    validar_caminhos()
 
     dici, ativos_ip, ativos_trans, sites = preparar_bases()
     resultado = comparar_bases(dici, ativos_ip, ativos_trans, sites)
