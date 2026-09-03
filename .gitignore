@@ -13,4 +13,4 @@ __pycache__/
 .env
 
 # Arquivos gerados
-Relatorio_Divergencias_*.xlsx
+Relatorio_Divergencias*.xlsx
