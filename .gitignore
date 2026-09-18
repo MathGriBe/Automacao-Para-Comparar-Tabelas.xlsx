@@ -14,3 +14,7 @@ __pycache__/
 
 # Arquivos gerados
 Relatorio_Divergencias*.xlsx
+Dashboard_Divergencias*.html
+dashboard_site/
+TAS_Servicos.csv
+servidor_dashboard.log

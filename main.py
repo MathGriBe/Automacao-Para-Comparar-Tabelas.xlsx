@@ -1,13 +1,17 @@
+import base64
+import json
 import logging
 import os
+import re
 import smtplib
 import unicodedata
+import webbrowser
 from datetime import datetime
 from email.message import EmailMessage
-from email.utils import formataddr
 
 import pandas as pd
 from dotenv import load_dotenv
+from openpyxl.styles import Font, PatternFill
 
 # =============================
 # CONFIGURAÇÕES
@@ -18,7 +22,6 @@ load_dotenv()
 EMAIL_REMETENTE = os.getenv("EMAIL_REMETENTE", "")
 EMAIL_SENHA = os.getenv("EMAIL_SENHA", "")
 EMAIL_DESTINATARIO = os.getenv("EMAIL_DESTINATARIO", "")
-EMAIL_NOME_REMETENTE = os.getenv("EMAIL_NOME_REMETENTE", "Matheus Bevilaqua")
 
 SMTP_SERVIDOR = os.getenv("SMTP_SERVIDOR", "smtp.office365.com")
 SMTP_PORTA = int(os.getenv("SMTP_PORTA", "587"))
@@ -27,22 +30,37 @@ ARQ_DICI = os.path.normpath(os.getenv("ARQ_DICI", ""))
 ARQ_ATIVOS = os.path.normpath(os.getenv("ARQ_ATIVOS", ""))
 ARQ_SITES = os.path.normpath(os.getenv("ARQ_SITES", ""))
 
+# Arquivo compartilhado (idealmente numa pasta de rede) onde a equipe
+# registra o último TAS de cada serviço. Aponte ARQ_TAS no .env para o
+# caminho de rede; se não configurado, usa um arquivo local.
+ARQ_TAS = os.getenv("ARQ_TAS", "TAS_Servicos.csv")
+
 RELATORIO_SAIDA = f"Relatorio_Divergencias_{datetime.now().strftime('%Y%m%d')}.xlsx"
+DASHBOARD_SAIDA = f"Dashboard_Divergencias_{datetime.now().strftime('%Y%m%d')}.html"
+ABRIR_DASHBOARD_AUTOMATICO = True
+
+# Pasta servida pelo servidor_dashboard.py. Contém SÓ o dashboard (nunca o
+# projeto inteiro, pra não expor o .env e as planilhas na rede). O nome do
+# arquivo é fixo para o link de acesso não mudar a cada execução.
+SITE_DIR = "dashboard_site"
+SITE_ARQUIVO = os.path.join(SITE_DIR, "index.html")
+
+LOGO_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo_eletronet_azul.jpg")
 
 LOG_ARQUIVO = "automacao_servicos.log"
 
 SHEET_DICI = os.getenv("SHEET_DICI", "vw_Servicos_Ativos_CS")
-SHEET_ATIVOS_IP = os.getenv("SHEET_ATIVOS_IP", "Abr_26_IP")
-SHEET_ATIVOS_TRANS = os.getenv("SHEET_ATIVOS_TRANS", "Abr_26_Transp")
+SHEET_ATIVOS_IP = os.getenv("SHEET_ATIVOS_IP", "Set_26_IP")
+SHEET_ATIVOS_TRANS = os.getenv("SHEET_ATIVOS_TRANS", "Set_26_Transp")
 SHEET_SITES = os.getenv("SHEET_SITES", "Planilha1")
 
 HEADER_ATIVOS = int(os.getenv("HEADER_ATIVOS", "2"))
 HEADER_SITES = int(os.getenv("HEADER_SITES", "2"))
 
-ENVIAR_EMAIL = os.getenv("ENVIAR_EMAIL", "false").strip().lower() == "true"
+ENVIAR_EMAIL = False
 
-# Serviços que devem ser desconsiderados da análise
-FILTRO_SUBSTRING_IGNORAR = "ESCH"
+# Serviços que devem ser desconsiderados da análise (substring contida no nome)
+FILTROS_SUBSTRING_IGNORAR = ["ESCH", "CFO", "155M", "RPEE"]
 FILTRO_TAMANHO_MINIMO = 15
 
 # =============================
@@ -82,12 +100,23 @@ def limpar_texto(col):
     return col.apply(normalizar_texto)
 
 
+def extrair_servico_base(servico):
+    """
+    Remove o sufixo de porta/canal do final do código do serviço
+    (ex.: 'MUZMBO/ASR/IPFL/001' -> 'MUZMBO/ASR/IPFL'), permitindo
+    agrupar todas as portas de um mesmo serviço contratado antes
+    de comparar a capacidade total com o XCONN.
+    """
+    return re.sub(r"/\d+$", "", servico)
+
+
 def classificar_tecnologia(tecnologia):
     transporte = ["MetroEthernet", "Espectro"]
     ip = [
         "IP Flat", "IP Flat Burstable",
         "IP no PIX", "IP no PIX Burstable",
-        "IP no POP", "IP no POP Brasil", "IP no POP Burstable"
+        "IP no POP", "IP no POP Brasil", "IP no POP Burstable",
+        "IP Conteudo",
     ]
 
     if tecnologia in transporte:
@@ -103,22 +132,73 @@ def ler_arquivo_excel(caminho, sheet_name, header=None):
     return pd.read_excel(caminho, sheet_name=sheet_name, header=header)
 
 
+def cortar_antes_do_marcador(df, marcador):
+    """
+    As abas de Ativos trazem, abaixo da tabela de serviços ativos, blocos de
+    'DESATIVAÇÃO (mensal)' e '(acumulado 2025)' com as mesmas colunas
+    (Serviços, Capacidade (GB)...). Sem esse corte, esses serviços já
+    desativados entrariam na comparação como se ainda estivessem ativos.
+    Corta a tabela na primeira linha em que QUALQUER coluna contém o
+    marcador, mantendo só as linhas de serviços realmente ativos.
+    """
+    mask = df.astype(str).apply(lambda col: col.str.contains(marcador, case=False, na=False))
+    linhas_marcadas = df.index[mask.any(axis=1)]
+    if linhas_marcadas.empty:
+        return df
+    primeira_linha = linhas_marcadas[0]
+    logger.info(
+        f"Cortando tabela na linha {primeira_linha} (marcador '{marcador}' encontrado) "
+        f"para não incluir serviços desativados."
+    )
+    return df.loc[:primeira_linha].iloc[:-1].copy()
+
+
+def carregar_logo_base64(caminho):
+    """Lê o logo e devolve como data URI, pra embutir no HTML sem depender de arquivo externo."""
+    try:
+        with open(caminho, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception as e:
+        logger.warning(f"Não foi possível carregar o logo ({caminho}): {e}")
+        return ""
+
+
+def carregar_tas(caminho):
+    """
+    Lê o arquivo compartilhado (CSV) onde a equipe registra o último TAS de
+    cada serviço (colunas "Servico" e "Ultimo_TAS"). Se ainda não existir,
+    cria um vazio com o cabeçalho esperado para a equipe começar a preencher.
+    """
+    colunas = ["Servico", "Ultimo_TAS"]
+
+    if not os.path.exists(caminho):
+        try:
+            pd.DataFrame(columns=colunas).to_csv(caminho, index=False, encoding="utf-8-sig")
+            logger.info(f"Arquivo de TAS não encontrado, criado vazio em: {caminho}")
+        except Exception as e:
+            logger.warning(f"Não foi possível criar o arquivo de TAS ({caminho}): {e}")
+        return pd.DataFrame(columns=["Servico_Chave", "Ultimo_TAS"])
+
+    try:
+        tas = pd.read_csv(caminho, dtype=str, encoding="utf-8-sig")
+    except Exception as e:
+        logger.warning(f"Não foi possível ler o arquivo de TAS ({caminho}): {e}")
+        return pd.DataFrame(columns=["Servico_Chave", "Ultimo_TAS"])
+
+    if "Servico" not in tas.columns or "Ultimo_TAS" not in tas.columns:
+        logger.warning(f"Arquivo de TAS ({caminho}) sem as colunas esperadas {colunas}.")
+        return pd.DataFrame(columns=["Servico_Chave", "Ultimo_TAS"])
+
+    tas = tas[colunas].dropna(subset=["Servico"])
+    tas["Servico_Chave"] = tas["Servico"].apply(normalizar_texto)
+    tas = tas.drop_duplicates(subset="Servico_Chave", keep="last")
+    return tas[["Servico_Chave", "Ultimo_TAS"]]
+
+
 # =============================
 # PROCESSAMENTO
 # =============================
-
-def validar_caminhos():
-    for nome, caminho in [
-        ("ARQ_DICI", ARQ_DICI),
-        ("ARQ_ATIVOS", ARQ_ATIVOS),
-        ("ARQ_SITES", ARQ_SITES),
-    ]:
-        if not caminho or not os.path.isfile(caminho):
-            raise FileNotFoundError(
-                f"{nome} inválido ou não encontrado: {caminho!r}. "
-                f"Verifique o arquivo .env."
-            )
-
 
 def preparar_bases():
     logger.info("Lendo arquivos...")
@@ -151,17 +231,72 @@ def preparar_bases():
     # ATIVOS
     # =============================
 
+    # Remove os blocos de "DESATIVAÇÃO (mensal)" / "(acumulado 2025)" que
+    # aparecem abaixo da tabela principal nas duas abas — senão serviços já
+    # desativados entram na comparação como se estivessem ativos.
+    ativos_ip = cortar_antes_do_marcador(ativos_ip, "DESATIV")
+    ativos_trans = cortar_antes_do_marcador(ativos_trans, "DESATIV")
+
     ativos_ip = ativos_ip[["Serviços", "Capacidade (GB)"]].copy()
     ativos_trans = ativos_trans[["Serviços", "Capacidade (GB)"]].copy()
 
-    ativos_ip["Servico"] = limpar_texto(ativos_ip["Serviços"])
-    ativos_trans["Servico"] = limpar_texto(ativos_trans["Serviços"])
+    # Conjunto de serviços cadastrados no XCONN, usado para decidir a chave de agrupamento
+    servicos_dici = set(dici["Servico"])
+
+    def montar_chave_servico(servico_porta):
+        """
+        Decide a chave usada para casar com o XCONN:
+        - Se o nome EXATO (com o número final) já existe como serviço próprio
+          no XCONN, usa ele direto (comportamento normal, sem agrupar nada).
+        - Senão, tenta o nome BASE (sem o número final) — cobre o caso de um
+          serviço contratado dividido em múltiplas portas/canais, onde o
+          XCONN só tem o nome base cadastrado (ex.: MUZMBO/ASR/IPFL/001 e
+          /002 agrupados sob MUZMBO/ASR/IPFL).
+        - Se nenhum dos dois existir no XCONN, mantém o nome exato (vai
+          aparecer como "não encontrado no XCONN", igual antes).
+        Isso evita agrupar por engano serviços cujo código só termina em
+        número por outro motivo (ex.: um ID de circuito).
+        """
+        base = extrair_servico_base(servico_porta)
+        if servico_porta in servicos_dici:
+            return servico_porta
+        if base in servicos_dici:
+            return base
+        return servico_porta
+
+    # Nome completo (com porta/canal) e chave de agrupamento
+    ativos_ip["Servico_Porta"] = limpar_texto(ativos_ip["Serviços"])
+    ativos_trans["Servico_Porta"] = limpar_texto(ativos_trans["Serviços"])
+
+    ativos_ip["Servico"] = ativos_ip["Servico_Porta"].apply(montar_chave_servico)
+    ativos_trans["Servico"] = ativos_trans["Servico_Porta"].apply(montar_chave_servico)
 
     ativos_ip["Capacidade_IP"] = pd.to_numeric(ativos_ip["Capacidade (GB)"], errors="coerce")
     ativos_trans["Capacidade_Trans"] = pd.to_numeric(ativos_trans["Capacidade (GB)"], errors="coerce")
 
-    ativos_ip = ativos_ip.drop_duplicates(subset="Servico", keep="first")
-    ativos_trans = ativos_trans.drop_duplicates(subset="Servico", keep="first")
+    # Remove porta duplicada exata (mesma porta aparecendo 2x na planilha)
+    ativos_ip = ativos_ip.drop_duplicates(subset="Servico_Porta", keep="first")
+    ativos_trans = ativos_trans.drop_duplicates(subset="Servico_Porta", keep="first")
+
+    # Detalhe por porta, para auditoria (ex.: "MUZMBO/ASR/IPFL/001=60 | MUZMBO/ASR/IPFL/002=40")
+    ativos_ip["Detalhe_Porta_IP"] = (
+        ativos_ip["Servico_Porta"] + "=" + ativos_ip["Capacidade_IP"].round(2).astype(str)
+    )
+    ativos_trans["Detalhe_Porta_Trans"] = (
+        ativos_trans["Servico_Porta"] + "=" + ativos_trans["Capacidade_Trans"].round(2).astype(str)
+    )
+
+    # Agrupa pela chave definida acima, somando a capacidade quando há mais de uma porta
+    ativos_ip = ativos_ip.groupby("Servico", as_index=False).agg(
+        Capacidade_IP=("Capacidade_IP", "sum"),
+        Qtd_Portas_IP=("Servico_Porta", "count"),
+        Detalhe_Portas_IP=("Detalhe_Porta_IP", lambda s: " | ".join(s)),
+    )
+    ativos_trans = ativos_trans.groupby("Servico", as_index=False).agg(
+        Capacidade_Trans=("Capacidade_Trans", "sum"),
+        Qtd_Portas_Trans=("Servico_Porta", "count"),
+        Detalhe_Portas_Trans=("Detalhe_Porta_Trans", lambda s: " | ".join(s)),
+    )
 
     # =============================
     # SITES
@@ -186,8 +321,8 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
         columns={"NmServico": "Nome_XCONN"}
     )
 
-    ativos_ip_m = ativos_ip[["Servico", "Capacidade_IP"]]
-    ativos_trans_m = ativos_trans[["Servico", "Capacidade_Trans"]]
+    ativos_ip_m = ativos_ip[["Servico", "Capacidade_IP", "Qtd_Portas_IP", "Detalhe_Portas_IP"]]
+    ativos_trans_m = ativos_trans[["Servico", "Capacidade_Trans", "Qtd_Portas_Trans", "Detalhe_Portas_Trans"]]
     sites_m = sites[["Servico"]].assign(Existe_Sites=True)
 
     # --- Outer join de todas as bases pelo código normalizado do serviço ---
@@ -204,17 +339,19 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
     # --- Nome de exibição: usa o nome do XCONN quando existir, senão o código normalizado ---
     base["Servico_Exibicao"] = base["Nome_XCONN"].fillna(base["Servico"])
 
-    # --- Filtro: desconsidera serviços com "ESCH" no nome ou com nome muito curto ---
+    # --- Filtro: desconsidera serviços com algum dos nomes de FILTROS_SUBSTRING_IGNORAR ou nome muito curto ---
     nome_upper = base["Servico_Exibicao"].astype(str).str.upper()
-    mask_ignorar_esch = nome_upper.str.contains(FILTRO_SUBSTRING_IGNORAR, na=False)
+    mask_ignorar_substring = pd.Series(False, index=base.index)
+    for substring in FILTROS_SUBSTRING_IGNORAR:
+        mask_ignorar_substring |= nome_upper.str.contains(substring.upper(), na=False)
     mask_ignorar_curto = base["Servico_Exibicao"].astype(str).str.len() < FILTRO_TAMANHO_MINIMO
-    qtd_ignorados = int((mask_ignorar_esch | mask_ignorar_curto).sum())
+    qtd_ignorados = int((mask_ignorar_substring | mask_ignorar_curto).sum())
     if qtd_ignorados:
         logger.info(
-            f"Ignorando {qtd_ignorados} serviço(s) por conter '{FILTRO_SUBSTRING_IGNORAR}' "
+            f"Ignorando {qtd_ignorados} serviço(s) por conter {FILTROS_SUBSTRING_IGNORAR} "
             f"ou ter menos de {FILTRO_TAMANHO_MINIMO} caracteres."
         )
-    base = base[~(mask_ignorar_esch | mask_ignorar_curto)].copy()
+    base = base[~(mask_ignorar_substring | mask_ignorar_curto)].copy()
 
     # --- Capacidade de Ativos correspondente ao tipo declarado no XCONN ---
     def capacidade_ativos_correspondente(row):
@@ -225,6 +362,16 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
         return pd.NA
 
     base["Gb_Ativos_Correspondente"] = base.apply(capacidade_ativos_correspondente, axis=1)
+
+    # --- Sinaliza quando a capacidade veio da soma de mais de uma porta/canal ---
+    def validado_via_soma_portas(row):
+        if row["Tipo"] == "IP" and pd.notna(row.get("Qtd_Portas_IP")) and row["Qtd_Portas_IP"] > 1:
+            return True
+        if row["Tipo"] == "TRANSPORTE" and pd.notna(row.get("Qtd_Portas_Trans")) and row["Qtd_Portas_Trans"] > 1:
+            return True
+        return False
+
+    base["Validado_Via_Soma_Portas"] = base.apply(validado_via_soma_portas, axis=1)
 
     # --- Monta a lista de divergências linha a linha ---
     def montar_status(row):
@@ -266,6 +413,49 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
 
     base["Status"] = base.apply(montar_status, axis=1)
 
+    # --- Revalida por SOMA DO GRUPO: cobre o caso em que cada porta já tem seu
+    # próprio registro no XCONN (então a comparação porta a porta acusa
+    # divergência em cada uma), mas a SOMA de todas as portas do mesmo serviço
+    # base é igual nas duas pontas (ex.: XCONN tem 10 + 2,5 = 12,5 e Ativos tem
+    # 6,25 + 6,25 = 12,5 — o total contratado bate, só a distribuição entre
+    # portas é diferente).
+    base["Servico_Base_Agrupamento"] = base["Servico"].apply(extrair_servico_base)
+
+    def revalidar_grupo_por_soma(indices):
+        grupo = base.loc[indices]
+        if len(grupo) < 2:
+            return
+
+        tipos_grupo = grupo["Tipo"].dropna().unique()
+        if len(tipos_grupo) != 1:
+            return
+        tipo = tipos_grupo[0]
+
+        soma_xconn = grupo["Velocidade_Gb"].sum(min_count=1)
+        if tipo == "IP":
+            soma_ativos = grupo["Capacidade_IP"].sum(min_count=1)
+        elif tipo == "TRANSPORTE":
+            soma_ativos = grupo["Capacidade_Trans"].sum(min_count=1)
+        else:
+            return
+
+        if pd.isna(soma_xconn) or pd.isna(soma_ativos):
+            return
+        if round(soma_xconn, 2) != round(soma_ativos, 2):
+            return
+
+        # Soma do grupo bate: remove a divergência de capacidade de cada linha
+        for idx in indices:
+            partes = [
+                p for p in base.at[idx, "Status"].split("; ")
+                if p != "Capacidade divergente entre XCONN e Ativos"
+            ]
+            base.at[idx, "Status"] = "; ".join(partes) if partes else "OK"
+            base.at[idx, "Validado_Via_Soma_Portas"] = True
+
+    for _, indices in base.groupby("Servico_Base_Agrupamento").groups.items():
+        revalidar_grupo_por_soma(indices)
+
     resultado = base[[
         "Servico_Exibicao",
         "Tipo",
@@ -275,14 +465,25 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
         "Existe_Sites",
         "Velocidade_Gb",
         "Capacidade_IP",
+        "Qtd_Portas_IP",
+        "Detalhe_Portas_IP",
         "Capacidade_Trans",
+        "Qtd_Portas_Trans",
+        "Detalhe_Portas_Trans",
+        "Validado_Via_Soma_Portas",
         "Status",
     ]].rename(columns={
         "Servico_Exibicao": "Servico",
         "Velocidade_Gb": "Gb_XCONN",
-        "Capacidade_IP": "Gb_Ativos_IP",
-        "Capacidade_Trans": "Gb_Ativos_Transporte",
+        "Capacidade_IP": "Gb_Ativos_IP_Total",
+        "Capacidade_Trans": "Gb_Ativos_Transporte_Total",
     })
+
+    # --- Preenche o último TAS registrado pela equipe (arquivo compartilhado) ---
+    tas = carregar_tas(ARQ_TAS)
+    resultado["Servico_Chave"] = resultado["Servico"].apply(normalizar_texto)
+    resultado = resultado.merge(tas, on="Servico_Chave", how="left").drop(columns="Servico_Chave")
+    resultado["Ultimo_TAS"] = resultado["Ultimo_TAS"].fillna("")
 
     # Ordena colocando as divergências primeiro
     resultado = resultado.sort_values(
@@ -290,6 +491,21 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
     ).reset_index(drop=True)
 
     return resultado
+
+
+COR_FUNDO_CABECALHO = "1F497D"
+COR_FONTE_CABECALHO = "F79646"
+
+
+def estilizar_cabecalho(worksheet):
+    """Aplica fundo azul (#1F497D) e letra laranja (#F79646) na primeira linha da aba."""
+    preenchimento = PatternFill(
+        start_color=COR_FUNDO_CABECALHO, end_color=COR_FUNDO_CABECALHO, fill_type="solid"
+    )
+    fonte = Font(color=COR_FONTE_CABECALHO, bold=True)
+    for celula in worksheet[1]:
+        celula.fill = preenchimento
+        celula.font = fonte
 
 
 def gerar_relatorio(df):
@@ -302,173 +518,355 @@ def gerar_relatorio(df):
         "Valor": [total, total - divergentes, divergentes],
     })
 
-    # A planilha de Divergencias exibe apenas os serviços que não estão OK
-    df_divergentes = df[divergentes_mask].reset_index(drop=True)
+    # Divergencias: resumida, só com o essencial (serviço, tipo, motivo, último TAS)
+    df_divergentes = (
+        df[divergentes_mask][["Servico", "Tipo", "Status", "Ultimo_TAS"]]
+        .rename(columns={"Status": "Motivo_Divergencia"})
+        .reset_index(drop=True)
+    )
+
+    # Divergencia_Detalhada: mesmas linhas divergentes, mas com todas as colunas
+    df_divergentes_detalhado = df[divergentes_mask].reset_index(drop=True)
 
     with pd.ExcelWriter(RELATORIO_SAIDA, engine="openpyxl") as writer:
         df_divergentes.to_excel(writer, sheet_name="Divergencias", index=False)
+        df_divergentes_detalhado.to_excel(writer, sheet_name="Divergencia_Detalhada", index=False)
         resumo.to_excel(writer, sheet_name="Resumo", index=False)
+
+        for nome_aba in ["Divergencias", "Divergencia_Detalhada", "Resumo"]:
+            estilizar_cabecalho(writer.sheets[nome_aba])
 
     logger.info(f"Relatório gerado: {RELATORIO_SAIDA} ({divergentes}/{total} divergências)")
 
-    return {
-        "total": total,
-        "ok": total - divergentes,
-        "divergentes": divergentes,
-        "tipos": _contar_tipos_divergencia(df),
-    }
 
+def gerar_dashboard_html(df):
+    """
+    Gera um dashboard HTML autocontido (sem depender de internet/CDN) com
+    busca, filtro por Tipo/Status e cores, pra visualizar o que precisa
+    sincronizar sem precisar abrir o Excel.
+    """
+    total = len(df)
+    divergentes = int((df["Status"] != "OK").sum())
+    ok = total - divergentes
 
-def _contar_tipos_divergencia(df):
-    """Conta quantas vezes cada tipo de divergência aparece (um serviço pode ter vários)."""
-    tipos = {}
-    for status in df.loc[df["Status"] != "OK", "Status"]:
-        for item in str(status).split(";"):
-            item = item.strip()
-            if item:
-                tipos[item] = tipos.get(item, 0) + 1
-    return sorted(tipos.items(), key=lambda par: par[1], reverse=True)
+    colunas_exibicao = ["Servico", "Tipo", "Status", "Gb_XCONN"]
+    if "Gb_Ativos_IP_Total" in df.columns:
+        colunas_exibicao.append("Gb_Ativos_IP_Total")
+    if "Gb_Ativos_Transporte_Total" in df.columns:
+        colunas_exibicao.append("Gb_Ativos_Transporte_Total")
+    colunas_exibicao.append("Validado_Via_Soma_Portas")
+    if "Ultimo_TAS" in df.columns:
+        colunas_exibicao.append("Ultimo_TAS")
 
+    registros = df[colunas_exibicao].fillna("").to_dict(orient="records")
+    dados_json = json.dumps(registros, ensure_ascii=False)
 
-def _montar_corpo_email(stats):
-    """Retorna (texto_plano, html) para o e-mail do relatório."""
-    data_hoje = datetime.now().strftime("%d/%m/%Y")
-    total = stats["total"]
-    ok = stats["ok"]
-    div = stats["divergentes"]
-    pct = (div / total * 100) if total else 0
+    # IP e TRANSPORTE sempre aparecem no dropdown/botões de setor, mesmo que
+    # não haja nenhum serviço desse tipo na execução atual.
+    tipos_padrao = ["IP", "TRANSPORTE"]
+    tipos_extras = [t for t in sorted(df["Tipo"].dropna().unique().tolist()) if t not in tipos_padrao]
+    tipos_disponiveis = tipos_padrao + tipos_extras
+    opcoes_tipo = "".join(f'<option value="{t}">{t}</option>' for t in tipos_disponiveis)
 
-    # ---- Versão texto (fallback) ----
-    linhas_txt = [
-        "Olá,",
-        "",
-        f"Segue em anexo o relatório de divergências gerado automaticamente em {data_hoje}.",
-        "",
-        "Resumo:",
-        f"  - Serviços analisados : {total}",
-        f"  - Serviços OK         : {ok}",
-        f"  - Com divergência     : {div} ({pct:.1f}%)",
-        "",
-    ]
-    if stats["tipos"]:
-        linhas_txt.append("Principais tipos de divergência:")
-        for nome, qtd in stats["tipos"][:8]:
-            linhas_txt.append(f"  - {nome}: {qtd}")
-        linhas_txt.append("")
-    linhas_txt += [
-        "O detalhamento serviço a serviço está na planilha anexa (aba 'Divergencias').",
-        "",
-        "Mensagem gerada automaticamente - favor não responder.",
-    ]
-    texto = "\n".join(linhas_txt)
+    logo_src = carregar_logo_base64(LOGO_ARQUIVO)
+    logo_html = f'<img src="{logo_src}" class="logo" alt="Eletronet">' if logo_src else ""
 
-    # ---- Versão HTML ----
-    linhas_tipos_html = ""
-    for nome, qtd in stats["tipos"][:8]:
-        linhas_tipos_html += (
-            "<tr>"
-            f'<td style="padding:8px 12px;border-bottom:1px solid #eaeaea;font-size:13px;color:#333;">{nome}</td>'
-            f'<td style="padding:8px 12px;border-bottom:1px solid #eaeaea;font-size:13px;color:#333;text-align:right;font-weight:bold;">{qtd}</td>'
-            "</tr>"
-        )
-    if not linhas_tipos_html:
-        linhas_tipos_html = (
-            '<tr><td colspan="2" style="padding:8px 12px;font-size:13px;color:#333;">'
-            "Nenhuma divergência encontrada nesta execução.</td></tr>"
-        )
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Dashboard de Divergências - {datetime.now().strftime('%d/%m/%Y')}</title>
+<style>
+    :root {{
+        --azul: #1F497D;
+        --laranja: #F79646;
+        --verde: #2e7d32;
+        --vermelho: #c62828;
+        --fundo: #f4f6f8;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+        font-family: -apple-system, Segoe UI, Arial, sans-serif;
+        background: var(--fundo);
+        margin: 0;
+        padding: 24px;
+        color: #222;
+    }}
+    .cabecalho {{
+        display: flex; justify-content: space-between; align-items: flex-start;
+        gap: 16px; flex-wrap: wrap;
+    }}
+    .logo {{ height: 75px; width: 150px; }}
+    h1 {{ color: var(--azul); margin-bottom: 4px; }}
+    .subtitulo {{ color: #666; margin-top: 0; margin-bottom: 20px; }}
+    .cards {{ display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }}
+    .card {{
+        background: white; border-radius: 8px; padding: 16px 24px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.15); min-width: 140px;
+    }}
+    .card .numero {{ font-size: 28px; font-weight: bold; }}
+    .card .rotulo {{ color: #666; font-size: 13px; }}
+    .card.total .numero {{ color: var(--azul); }}
+    .card.ok .numero {{ color: var(--verde); }}
+    .card.divergente .numero {{ color: var(--vermelho); }}
+    .barra-fixa {{
+        position: sticky; top: 0; z-index: 10;
+        background: var(--fundo); padding: 12px 0 4px;
+        box-shadow: 0 4px 6px -6px rgba(0,0,0,0.3);
+    }}
+    .setores {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }}
+    .btn-setor {{
+        padding: 8px 16px; border: 1px solid var(--azul); border-radius: 6px;
+        background: white; color: var(--azul); font-size: 13px; font-weight: 600;
+        cursor: pointer;
+    }}
+    .btn-setor:hover {{ background: #eef2f7; }}
+    .btn-setor.ativo {{ background: var(--azul); color: white; }}
+    .controles {{
+        display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center;
+    }}
+    .controles input, .controles select {{
+        padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px;
+    }}
+    .controles input[type="text"] {{ flex: 1; min-width: 220px; }}
+    table {{
+        width: 100%; border-collapse: collapse; background: white;
+        border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    }}
+    thead th {{
+        background: var(--azul); color: var(--laranja); text-align: left;
+        padding: 10px 12px; font-size: 13px; cursor: pointer; user-select: none;
+        white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.25);
+    }}
+    thead th:last-child {{ border-right: none; }}
+    thead th:hover {{ opacity: 0.9; }}
+    .seta-ordenacao {{ display: inline-block; width: 12px; font-size: 11px; opacity: 0.9; }}
+    tbody td {{
+        padding: 9px 12px; font-size: 13px;
+        border-top: 1px dashed #ccc; border-right: 1px solid #e0e0e0;
+    }}
+    tbody td:last-child {{ border-right: none; }}
+    tbody tr.status-ok {{ background: #f1f8f1; }}
+    tbody tr.status-divergente {{ background: #fdf1f0; }}
+    .badge {{
+        display: inline-block; padding: 2px 8px; border-radius: 10px;
+        font-size: 12px; font-weight: 600;
+    }}
+    .badge-ok {{ background: #c8e6c9; color: var(--verde); }}
+    .badge-divergente {{ background: #ffcdd2; color: var(--vermelho); }}
+    .contagem {{ color: #666; font-size: 13px; margin-top: 8px; }}
+    .sem-resultado {{ text-align: center; padding: 30px; color: #888; }}
+</style>
+</head>
+<body>
 
-    html = f"""\
-<html>
-  <body style="margin:0;padding:0;background:#f4f5f7;font-family:Segoe UI,Arial,sans-serif;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;border:1px solid #e5e7eb;">
-            <tr>
-              <td style="background:#1f4e79;padding:20px 28px;">
-                <span style="color:#ffffff;font-size:18px;font-weight:bold;">Relatório de Divergências de Serviços</span><br>
-                <span style="color:#cfe0f0;font-size:13px;">{data_hoje}</span>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:24px 28px 8px 28px;font-size:14px;color:#333;line-height:1.5;">
-                Olá,<br><br>
-                Segue o resultado da comparação automática entre as bases (XCONN, Ativos IP/Transporte e Sites).
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:12px 28px;">
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                  <tr>
-                    <td width="33%" align="center" style="padding:12px;background:#f0f4f8;border-radius:6px;">
-                      <div style="font-size:22px;font-weight:bold;color:#1f4e79;">{total}</div>
-                      <div style="font-size:12px;color:#666;">Analisados</div>
-                    </td>
-                    <td width="4"></td>
-                    <td width="33%" align="center" style="padding:12px;background:#eef7ee;border-radius:6px;">
-                      <div style="font-size:22px;font-weight:bold;color:#2e7d32;">{ok}</div>
-                      <div style="font-size:12px;color:#666;">OK</div>
-                    </td>
-                    <td width="4"></td>
-                    <td width="33%" align="center" style="padding:12px;background:#fdecec;border-radius:6px;">
-                      <div style="font-size:22px;font-weight:bold;color:#c62828;">{div}</div>
-                      <div style="font-size:12px;color:#666;">Divergências ({pct:.1f}%)</div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:20px 28px 8px 28px;font-size:14px;color:#333;font-weight:bold;">
-                Principais tipos de divergência
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:0 28px 16px 28px;">
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eaeaea;border-radius:6px;">
-                  {linhas_tipos_html}
-                </table>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:8px 28px 24px 28px;font-size:13px;color:#555;line-height:1.5;">
-                O detalhamento serviço a serviço está na planilha anexa, na aba <b>Divergencias</b>.
-              </td>
-            </tr>
-            <tr>
-              <td style="background:#f0f0f0;padding:14px 28px;font-size:11px;color:#888;">
-                Mensagem gerada automaticamente pela rotina de comparação de dados. Favor não responder.
-              </td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
+<div class="cabecalho">
+    <div>
+        <h1>Dashboard de Divergências</h1>
+        <p class="subtitulo">Gerado em {datetime.now().strftime('%d/%m/%Y às %H:%M')}</p>
+    </div>
+    {logo_html}
+</div>
+
+<div class="cards">
+    <div class="card total"><div class="numero">{total}</div><div class="rotulo">Total analisado</div></div>
+    <div class="card ok"><div class="numero">{ok}</div><div class="rotulo">OK</div></div>
+    <div class="card divergente"><div class="numero">{divergentes}</div><div class="rotulo">Precisam sincronizar</div></div>
+</div>
+
+<div class="barra-fixa">
+    <div class="setores">
+        <button type="button" class="btn-setor" data-tipo="todos">Todos os setores</button>
+        <button type="button" class="btn-setor" data-tipo="IP">Só IP</button>
+        <button type="button" class="btn-setor" data-tipo="TRANSPORTE">Só Transporte</button>
+    </div>
+
+    <div class="controles">
+        <input type="text" id="busca" placeholder="Buscar por nome do serviço...">
+        <select id="filtroStatus">
+            <option value="divergente">Só divergentes</option>
+            <option value="todos">Todos</option>
+            <option value="ok">Só OK</option>
+        </select>
+        <select id="filtroTipo">
+            <option value="todos">Todos os tipos</option>
+            {opcoes_tipo}
+        </select>
+    </div>
+</div>
+
+<table id="tabela">
+    <thead>
+        <tr>
+            <th data-col="Servico">Serviço<span class="seta-ordenacao"></span></th>
+            <th data-col="Tipo">Tipo<span class="seta-ordenacao"></span></th>
+            <th data-col="Status">Status<span class="seta-ordenacao"></span></th>
+            <th data-col="Gb_XCONN">Gb XCONN<span class="seta-ordenacao"></span></th>
+            <th data-col="Gb_Ativos_IP_Total">Gb Ativos IP<span class="seta-ordenacao"></span></th>
+            <th data-col="Gb_Ativos_Transporte_Total">Gb Ativos Transp.<span class="seta-ordenacao"></span></th>
+            <th data-col="Validado_Via_Soma_Portas">Validado por soma?<span class="seta-ordenacao"></span></th>
+            <th data-col="Ultimo_TAS">Último TAS<span class="seta-ordenacao"></span></th>
+        </tr>
+    </thead>
+    <tbody></tbody>
+</table>
+<div class="sem-resultado" id="semResultado" style="display:none;">Nenhum serviço encontrado com esse filtro.</div>
+<p class="contagem" id="contagem"></p>
+
+<script>
+    const dados = {dados_json};
+    let ordenacaoAtual = {{ coluna: null, asc: true }};
+
+    function renderizar() {{
+        const busca = document.getElementById('busca').value.trim().toUpperCase();
+        const filtroStatus = document.getElementById('filtroStatus').value;
+        const filtroTipo = document.getElementById('filtroTipo').value;
+
+        let linhas = dados.filter(function(linha) {{
+            const ehOk = linha.Status === 'OK';
+            if (filtroStatus === 'divergente' && ehOk) return false;
+            if (filtroStatus === 'ok' && !ehOk) return false;
+            if (filtroTipo !== 'todos' && linha.Tipo !== filtroTipo) return false;
+            if (busca && !String(linha.Servico).toUpperCase().includes(busca)) return false;
+            return true;
+        }});
+
+        if (ordenacaoAtual.coluna) {{
+            const col = ordenacaoAtual.coluna;
+            linhas = linhas.slice().sort(function(a, b) {{
+                const va = a[col], vb = b[col];
+                if (va < vb) return ordenacaoAtual.asc ? -1 : 1;
+                if (va > vb) return ordenacaoAtual.asc ? 1 : -1;
+                return 0;
+            }});
+        }}
+
+        const tbody = document.querySelector('#tabela tbody');
+        tbody.innerHTML = '';
+        document.getElementById('semResultado').style.display = linhas.length ? 'none' : 'block';
+
+        linhas.forEach(function(linha) {{
+            const ehOk = linha.Status === 'OK';
+            const tr = document.createElement('tr');
+            tr.className = ehOk ? 'status-ok' : 'status-divergente';
+            const badge = ehOk
+                ? '<span class="badge badge-ok">OK</span>'
+                : '<span class="badge badge-divergente">' + linha.Status + '</span>';
+            tr.innerHTML =
+                '<td>' + linha.Servico + '</td>' +
+                '<td>' + linha.Tipo + '</td>' +
+                '<td>' + badge + '</td>' +
+                '<td>' + linha.Gb_XCONN + '</td>' +
+                '<td>' + (linha.Gb_Ativos_IP_Total !== undefined ? linha.Gb_Ativos_IP_Total : '') + '</td>' +
+                '<td>' + (linha.Gb_Ativos_Transporte_Total !== undefined ? linha.Gb_Ativos_Transporte_Total : '') + '</td>' +
+                '<td>' + (linha.Validado_Via_Soma_Portas === true ? 'Sim' : '') + '</td>' +
+                '<td>' + (linha.Ultimo_TAS || '') + '</td>';
+            tbody.appendChild(tr);
+        }});
+
+        document.getElementById('contagem').textContent = linhas.length + ' de ' + dados.length + ' serviço(s) exibido(s)';
+    }}
+
+    function atualizarBotoesSetor() {{
+        const atual = document.getElementById('filtroTipo').value;
+        document.querySelectorAll('.btn-setor').forEach(function(btn) {{
+            btn.classList.toggle('ativo', btn.getAttribute('data-tipo') === atual);
+        }});
+    }}
+
+    document.querySelectorAll('.btn-setor').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+            document.getElementById('filtroTipo').value = btn.getAttribute('data-tipo');
+            atualizarBotoesSetor();
+            renderizar();
+        }});
+    }});
+
+    function atualizarSetasOrdenacao() {{
+        document.querySelectorAll('#tabela thead th').forEach(function(th) {{
+            const seta = th.querySelector('.seta-ordenacao');
+            const col = th.getAttribute('data-col');
+            if (ordenacaoAtual.coluna !== col) {{
+                seta.textContent = '';
+            }} else {{
+                seta.textContent = ordenacaoAtual.asc ? '▲' : '▼';
+            }}
+        }});
+    }}
+
+    document.querySelectorAll('#tabela thead th').forEach(function(th) {{
+        th.addEventListener('click', function() {{
+            const col = th.getAttribute('data-col');
+            if (ordenacaoAtual.coluna !== col) {{
+                // 1º clique na coluna: ordena crescente
+                ordenacaoAtual = {{ coluna: col, asc: true }};
+            }} else if (ordenacaoAtual.asc) {{
+                // 2º clique: ordena decrescente
+                ordenacaoAtual.asc = false;
+            }} else {{
+                // 3º clique: volta pra ordem padrão (sem ordenação, só filtro/busca)
+                ordenacaoAtual = {{ coluna: null, asc: true }};
+            }}
+            atualizarSetasOrdenacao();
+            renderizar();
+        }});
+    }});
+
+    document.getElementById('busca').addEventListener('input', renderizar);
+    document.getElementById('filtroStatus').addEventListener('change', renderizar);
+    document.getElementById('filtroTipo').addEventListener('change', function() {{
+        atualizarBotoesSetor();
+        renderizar();
+    }});
+
+    atualizarBotoesSetor();
+    atualizarSetasOrdenacao();
+    renderizar();
+</script>
+</body>
 </html>"""
 
-    return texto, html
+    with open(DASHBOARD_SAIDA, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    logger.info(f"Dashboard gerado: {DASHBOARD_SAIDA}")
+
+    # Cópia com nome fixo, servida pelo servidor_dashboard.py: assim o link
+    # de acesso continua o mesmo a cada execução, sempre com o conteúdo mais
+    # recente.
+    os.makedirs(SITE_DIR, exist_ok=True)
+    with open(SITE_ARQUIVO, "w", encoding="utf-8") as f:
+        f.write(html)
+    logger.info(f"Cópia do dashboard atualizada em: {SITE_ARQUIVO}")
+
+    if ABRIR_DASHBOARD_AUTOMATICO:
+        try:
+            webbrowser.open(f"file://{os.path.abspath(DASHBOARD_SAIDA)}")
+        except Exception as e:
+            logger.warning(f"Não foi possível abrir o dashboard automaticamente: {e}")
 
 
-def enviar_email_com_relatorio(arquivo_anexo, stats=None):
+def enviar_email_com_relatorio(arquivo_anexo, arquivo_dashboard=None):
     if not ENVIAR_EMAIL:
         logger.info("Envio de e-mail desabilitado nas configurações.")
         return
 
     logger.info("Preparando envio de e-mail...")
 
-    stats = stats or {"total": 0, "ok": 0, "divergentes": 0, "tipos": []}
-    texto, html = _montar_corpo_email(stats)
-
     msg = EmailMessage()
-    msg["Subject"] = (
-        f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')} "
-        f"({stats['divergentes']} divergência(s))"
-    )
-    msg["From"] = formataddr((EMAIL_NOME_REMETENTE, EMAIL_REMETENTE))
+    msg["Subject"] = f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')}"
+    msg["From"] = EMAIL_REMETENTE
     msg["To"] = EMAIL_DESTINATARIO
-    msg.set_content(texto)
-    msg.add_alternative(html, subtype="html")
+    msg.set_content("Olá,\n\nSegue em anexo o relatório de divergências gerado pela automação. "
+                     "Seu cliente de e-mail não exibiu a versão em HTML deste e-mail.")
+
+    if arquivo_dashboard:
+        try:
+            with open(arquivo_dashboard, "r", encoding="utf-8") as f:
+                dashboard_html = f.read()
+            msg.add_alternative(dashboard_html, subtype="html")
+        except Exception as e:
+            logger.warning(f"Não foi possível anexar o dashboard em HTML ao corpo do e-mail: {e}")
 
     try:
         with open(arquivo_anexo, "rb") as f:
@@ -476,7 +874,7 @@ def enviar_email_com_relatorio(arquivo_anexo, stats=None):
                 f.read(),
                 maintype="application",
                 subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                filename=os.path.basename(arquivo_anexo)
+                filename=arquivo_anexo
             )
 
         with smtplib.SMTP(SMTP_SERVIDOR, SMTP_PORTA) as server:
@@ -495,13 +893,12 @@ def enviar_email_com_relatorio(arquivo_anexo, stats=None):
 def main():
     logger.info("Iniciando...")
 
-    validar_caminhos()
-
     dici, ativos_ip, ativos_trans, sites = preparar_bases()
     resultado = comparar_bases(dici, ativos_ip, ativos_trans, sites)
-    stats = gerar_relatorio(resultado)
+    gerar_relatorio(resultado)
+    gerar_dashboard_html(resultado)
 
-    enviar_email_com_relatorio(RELATORIO_SAIDA, stats)
+    enviar_email_com_relatorio(RELATORIO_SAIDA, DASHBOARD_SAIDA)
 
     logger.info("Finalizado.")
 
