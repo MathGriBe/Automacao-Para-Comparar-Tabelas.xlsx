@@ -41,7 +41,7 @@ Tudo acontece no `main.py`, na funcao `main()`:
 1. **`preparar_bases()`**: le as abas configuradas, padroniza nomes de colunas e de servicos (caixa alta, sem acento, sem espaco), descarta nomes fora do formato `Trecho/Cliente/Tecnologia[/Porta]`, corta a planilha de Ativos antes do primeiro bloco `DESATIV` e agrupa portas/canais de um mesmo servico.
 2. **`comparar_bases()`**: monta uma base unica com a presenca de cada servico em cada fonte, remove servicos fora do escopo, compara capacidades e monta o `Status` de cada linha. Depois cruza com o CSV de ultimo TAS e ordena as divergencias primeiro.
 3. **`gerar_relatorio()`**: grava o Excel `Relatorio_Divergencias_YYYYMMDD.xlsx`.
-4. **`gerar_dashboard_html()`**: grava o `Dashboard_Divergencias_YYYYMMDD.html` e uma copia em `dashboard_site/index.html` (a pagina servida na rede).
+4. **`gerar_dashboard_html()`**: sobrescreve `dashboard_site/index.html` (a pagina servida na rede), sem criar arquivos novos a cada execucao.
 5. **`enviar_email_com_relatorio()`**: envia o e-mail de resumo com o Excel anexado, se `ENVIAR_EMAIL=true`.
 
 Tudo e registrado em `automacao_servicos.log`.
@@ -62,7 +62,7 @@ Tudo e registrado em `automacao_servicos.log`.
 `-- README.md
 ```
 
-Arquivos gerados pela execucao (ignorados no git): `Relatorio_Divergencias_*.xlsx`, `Dashboard_Divergencias_*.html`, `dashboard_site/`, `TAS_Servicos.csv`, `automacao_servicos.log`, `servidor_dashboard.log`.
+Arquivos gerados pela execucao (ignorados no git): `Relatorio_Divergencias_*.xlsx`, `dashboard_site/`, `TAS_Servicos.csv`, `automacao_servicos.log`, `servidor_dashboard.log`.
 
 ## Instalacao
 
@@ -188,7 +188,7 @@ Na consulta, "Tipo de Agendamento" deve ser semanal e "Hora da proxima execucao"
 
 Principais colunas: `Servico`, `Cliente`, `Tipo` (IP/TRANSPORTE/OUTROS), `Status`, `Gb_XCONN`, `Gb_Ativos_IP_Total`, `Gb_Ativos_Transporte_Total`, `Qtd_Portas_IP`, `Detalhe_Portas_IP`, `Qtd_Portas_Trans`, `Detalhe_Portas_Trans`, `Validado_Via_Soma_Portas`, `Ultimo_TAS`.
 
-**Dashboard** `Dashboard_Divergencias_YYYYMMDD.html` + copia em `dashboard_site/index.html`.
+**Dashboard** `dashboard_site/index.html` (sobrescrito a cada execucao).
 
 **Log** `automacao_servicos.log`.
 

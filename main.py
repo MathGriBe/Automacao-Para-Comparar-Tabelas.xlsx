@@ -5,11 +5,13 @@ import logging
 import os
 import re
 import smtplib
+import socket
 import unicodedata
 import webbrowser
 from datetime import datetime
 from email.message import EmailMessage
 from email.utils import make_msgid
+from urllib.parse import urlparse
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -38,7 +40,6 @@ ARQ_SITES = os.path.normpath(os.getenv("ARQ_SITES", ""))
 ARQ_TAS = os.getenv("ARQ_TAS", "TAS_Servicos.csv")
 
 RELATORIO_SAIDA = f"Relatorio_Divergencias_{datetime.now().strftime('%Y%m%d')}.xlsx"
-DASHBOARD_SAIDA = f"Dashboard_Divergencias_{datetime.now().strftime('%Y%m%d')}.html"
 ABRIR_DASHBOARD_AUTOMATICO = False
 
 # Pasta servida pelo servidor_dashboard.py. Contém SÓ o dashboard (nunca o
@@ -1029,22 +1030,17 @@ def gerar_dashboard_html(df):
 </body>
 </html>"""
 
-    with open(DASHBOARD_SAIDA, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    logger.info(f"Dashboard gerado: {DASHBOARD_SAIDA}")
-
-    # Cópia com nome fixo, servida pelo servidor_dashboard.py: assim o link
-    # de acesso continua o mesmo a cada execução, sempre com o conteúdo mais
-    # recente.
+    # Arquivo único com nome fixo, servido pelo servidor_dashboard.py: cada
+    # execução sobrescreve o anterior, então o link de acesso continua o mesmo
+    # e sempre mostra o conteúdo mais recente.
     os.makedirs(SITE_DIR, exist_ok=True)
     with open(SITE_ARQUIVO, "w", encoding="utf-8") as f:
         f.write(html)
-    logger.info(f"Cópia do dashboard atualizada em: {SITE_ARQUIVO}")
+    logger.info(f"Dashboard atualizado em: {SITE_ARQUIVO}")
 
     if ABRIR_DASHBOARD_AUTOMATICO:
         try:
-            webbrowser.open(f"file://{os.path.abspath(DASHBOARD_SAIDA)}")
+            webbrowser.open(f"file://{os.path.abspath(SITE_ARQUIVO)}")
         except Exception as e:
             logger.warning(f"Não foi possível abrir o dashboard automaticamente: {e}")
 
@@ -1071,6 +1067,29 @@ def resumo_para_email(df):
     }
 
 
+def links_dashboard():
+    """
+    Link principal (DASHBOARD_URL, normalmente pelo nome do PC) e um
+    alternativo pelo IP atual desta máquina, pra quando a rede não resolve o
+    nome. O servidor roda neste mesmo PC, então o IP descoberto aqui é o dele.
+    """
+    if not DASHBOARD_URL:
+        return None, None
+    url = urlparse(DASHBOARD_URL)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        return DASHBOARD_URL, None
+    finally:
+        s.close()
+    if ip.startswith("127.") or url.hostname == ip:
+        return DASHBOARD_URL, None
+    netloc = f"{ip}:{url.port}" if url.port else ip
+    return DASHBOARD_URL, url._replace(netloc=netloc).geturl()
+
+
 def gerar_email_texto(resumo):
     """Versão em texto puro, para clientes de e-mail que não exibem HTML."""
     linhas = [
@@ -1085,8 +1104,11 @@ def gerar_email_texto(resumo):
     ]
     for _, c in resumo["clientes"].iterrows():
         linhas.append(f"  - {c['Cliente']}: {c['Servicos_Divergentes']} de {c['Total_Servicos']}")
-    if DASHBOARD_URL:
-        linhas += ["", f"Dashboard interativo: {DASHBOARD_URL}"]
+    link, link_ip = links_dashboard()
+    if link:
+        linhas += ["", "Dashboard interativo (rede interna da Eletronet):", f"  {link}"]
+        if link_ip:
+            linhas.append(f"  Se não abrir, use: {link_ip}")
     linhas += ["", "O relatório completo segue em anexo (Excel)."]
     return "\n".join(linhas)
 
@@ -1170,17 +1192,35 @@ def gerar_email_html(resumo, logo_cid=None):
             f'<td align="right" style="padding:7px 10px;{fonte}font-size:13px;color:#444;"><b>{qtd}</b></td></tr>'
         )
 
-    botao = ""
-    if DASHBOARD_URL:
-        botao = (
-            f'<tr><td align="center" style="padding:24px;">'
+    # Bloco de acesso ao dashboard, logo abaixo dos números: botão + link por
+    # extenso (pra copiar e colar) + alternativo pelo IP.
+    bloco_dashboard = ""
+    link, link_ip = links_dashboard()
+    if link:
+        estilo_link = f"{fonte}font-size:13px;color:{azul};font-weight:bold;"
+        alternativo = (
+            f'<br>Se não abrir, tente: <a href="{esc(link_ip)}" style="{estilo_link}">{esc(link_ip)}</a>'
+            if link_ip else ""
+        )
+        bloco_dashboard = (
+            f'<tr><td style="padding:22px 24px 0;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="background:#eef4fb;border:1px solid #d3e2f2;border-left:5px solid {laranja};">'
+            f'<tr><td style="padding:18px 20px;{fonte}">'
+            f'<div style="font-size:16px;font-weight:bold;color:{azul};">Veja tudo no dashboard interativo</div>'
+            f'<div style="font-size:13px;color:#444;padding:4px 0 14px;line-height:1.5;">'
+            f'Filtre por setor e cliente e consulte o detalhe de cada serviço direto no navegador.</div>'
             f'<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
             f'<td style="background:{azul};border-radius:6px;">'
-            f'<a href="{esc(DASHBOARD_URL)}" style="display:inline-block;padding:12px 28px;{fonte}'
+            f'<a href="{esc(link)}" style="display:inline-block;padding:12px 30px;{fonte}'
             f'font-size:14px;font-weight:bold;color:#ffffff;text-decoration:none;">'
-            f'Abrir dashboard interativo</a></td></tr></table>'
-            f'<div style="{fonte}font-size:11px;color:{cinza};padding-top:6px;">'
-            f'Funciona na rede interna da Eletronet.</div></td></tr>'
+            f'Abrir dashboard &rarr;</a></td></tr></table>'
+            f'<div style="font-size:12px;color:{cinza};padding-top:14px;line-height:1.7;">'
+            f'Ou copie e cole no navegador: '
+            f'<a href="{esc(link)}" style="{estilo_link}">{esc(link)}</a>{alternativo}</div>'
+            f'<div style="font-size:11px;color:{cinza};padding-top:8px;">'
+            f'🔒 Acesso apenas pela rede interna da Eletronet.</div>'
+            f'</td></tr></table></td></tr>'
         )
 
     if resumo["divergentes"]:
@@ -1225,15 +1265,15 @@ def gerar_email_html(resumo, logo_cid=None):
 </td></tr>
 <tr><td style="padding:10px 24px 0;{fonte}font-size:12px;color:{cinza};">Divergências por setor: {setores_html}</td></tr>
 
+{bloco_dashboard}
+
 {titulo_secao('Clientes mais desincronizados')}
 <tr><td style="padding:0 24px;"><table {tabela}>{linhas_clientes}</table></td></tr>
 
 {titulo_secao('Principais motivos') if linhas_motivos else ''}
 {f'<tr><td style="padding:0 24px;"><table {tabela}>{linhas_motivos}</table></td></tr>' if linhas_motivos else ''}
 
-{botao or '<tr><td style="padding:12px;"></td></tr>'}
-
-<tr><td style="padding:0 24px 22px;{fonte}font-size:13px;color:#333;">
+<tr><td style="padding:22px 24px;{fonte}font-size:13px;color:#333;">
     📎 A lista completa, com o detalhamento de cada serviço, está na planilha em anexo.
 </td></tr>
 
