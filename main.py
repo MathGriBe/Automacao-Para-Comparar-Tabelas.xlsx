@@ -1,4 +1,5 @@
 import base64
+import html as html_lib
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import unicodedata
 import webbrowser
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import make_msgid
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -37,7 +39,7 @@ ARQ_TAS = os.getenv("ARQ_TAS", "TAS_Servicos.csv")
 
 RELATORIO_SAIDA = f"Relatorio_Divergencias_{datetime.now().strftime('%Y%m%d')}.xlsx"
 DASHBOARD_SAIDA = f"Dashboard_Divergencias_{datetime.now().strftime('%Y%m%d')}.html"
-ABRIR_DASHBOARD_AUTOMATICO = True
+ABRIR_DASHBOARD_AUTOMATICO = False
 
 # Pasta servida pelo servidor_dashboard.py. Contém SÓ o dashboard (nunca o
 # projeto inteiro, pra não expor o .env e as planilhas na rede). O nome do
@@ -46,6 +48,17 @@ SITE_DIR = "dashboard_site"
 SITE_ARQUIVO = os.path.join(SITE_DIR, "index.html")
 
 LOGO_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo_eletronet_azul.jpg")
+# No e-mail o logo fica numa faixa branca (o JPG não tem transparência),
+# então usa a versão de fundo branco.
+LOGO_EMAIL_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo_eletronet_branco.jpg")
+
+# Link do dashboard (servidor_dashboard.py) exibido como botão no e-mail.
+# Ex.: http://NOME-DO-PC:8000/ . Se vazio, o botão não aparece.
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "")
+
+# Quantos itens listar no corpo do e-mail (a lista completa vai no anexo)
+EMAIL_QTD_CLIENTES = 10
+EMAIL_QTD_MOTIVOS = 6
 
 LOG_ARQUIVO = "automacao_servicos.log"
 
@@ -57,11 +70,23 @@ SHEET_SITES = os.getenv("SHEET_SITES", "Planilha1")
 HEADER_ATIVOS = int(os.getenv("HEADER_ATIVOS", "2"))
 HEADER_SITES = int(os.getenv("HEADER_SITES", "2"))
 
-ENVIAR_EMAIL = False
+ENVIAR_EMAIL = os.getenv("ENVIAR_EMAIL", "false").strip().lower() == "true"
+
+# Texto de divergência usado no Status e no filtro "Só não encontrados em Sites"
+STATUS_NAO_ENCONTRADO_SITES = "Não encontrado em Sites"
 
 # Serviços que devem ser desconsiderados da análise (substring contida no nome)
-FILTROS_SUBSTRING_IGNORAR = ["ESCH", "CFO", "155M", "RPEE"]
+FILTROS_SUBSTRING_IGNORAR = ["ESCH", "CFO", "155M", "RPEE", "622M"]
 FILTRO_TAMANHO_MINIMO = 15
+
+# Formato de uma designação de serviço válida:
+# Trecho/Cliente/Tecnologia[/Porta] (a porta é opcional, pois o XCONN às vezes
+# só tem o nome base). Linhas das bases fora desse formato — nomes de anel,
+# rotas, títulos de bloco (ex.: ANEL7LITORALSUPERIOR, SERRADAMESA-CAMACARI) —
+# não são serviços e são descartadas antes da comparação. Designações com
+# complemento entre parênteses (ex.: ASS-GJA/A01/GETH/002 (VC4-2)) só marcam
+# uma rota na planilha e também são descartadas.
+PADRAO_DESIGNACAO_SERVICO = re.compile(r"^[^/()]+/[^/()]+/[^/()]+(/[^/()]+)?$")
 
 # =============================
 # LOG
@@ -98,6 +123,18 @@ def normalizar_texto(valor):
 
 def limpar_texto(col):
     return col.apply(normalizar_texto)
+
+
+def manter_so_designacoes_validas(df, coluna, nome_base):
+    """Descarta as linhas cujo nome não segue PADRAO_DESIGNACAO_SERVICO."""
+    mask_valido = df[coluna].str.match(PADRAO_DESIGNACAO_SERVICO)
+    invalidos = df.loc[~mask_valido & (df[coluna] != ""), coluna].unique()
+    if len(invalidos):
+        logger.info(
+            f"{nome_base}: ignorando {len(invalidos)} nome(s) fora do formato "
+            f"Trecho/Cliente/Tecnologia/Porta: {', '.join(invalidos)}"
+        )
+    return df[mask_valido].copy()
 
 
 def extrair_servico_base(servico):
@@ -218,9 +255,12 @@ def preparar_bases():
     # DICI
     # =============================
 
-    dici = dici[["NmServico", "NmTecnologia", "ValorMB"]].copy()
+    if "nmempresa" not in dici.columns:
+        dici["nmempresa"] = pd.NA
+    dici = dici[["NmServico", "nmempresa", "NmTecnologia", "ValorMB"]].copy()
 
     dici["Servico"] = limpar_texto(dici["NmServico"])
+    dici = manter_so_designacoes_validas(dici, "Servico", "XCONN")
     dici["Tipo"] = dici["NmTecnologia"].apply(classificar_tecnologia)
     dici["Velocidade_Gb"] = pd.to_numeric(dici["ValorMB"], errors="coerce") / 1000
 
@@ -237,8 +277,11 @@ def preparar_bases():
     ativos_ip = cortar_antes_do_marcador(ativos_ip, "DESATIV")
     ativos_trans = cortar_antes_do_marcador(ativos_trans, "DESATIV")
 
-    ativos_ip = ativos_ip[["Serviços", "Capacidade (GB)"]].copy()
-    ativos_trans = ativos_trans[["Serviços", "Capacidade (GB)"]].copy()
+    for df_ativos in (ativos_ip, ativos_trans):
+        if "Clientes" not in df_ativos.columns:
+            df_ativos["Clientes"] = pd.NA
+    ativos_ip = ativos_ip[["Serviços", "Clientes", "Capacidade (GB)"]].copy()
+    ativos_trans = ativos_trans[["Serviços", "Clientes", "Capacidade (GB)"]].copy()
 
     # Conjunto de serviços cadastrados no XCONN, usado para decidir a chave de agrupamento
     servicos_dici = set(dici["Servico"])
@@ -267,6 +310,8 @@ def preparar_bases():
     # Nome completo (com porta/canal) e chave de agrupamento
     ativos_ip["Servico_Porta"] = limpar_texto(ativos_ip["Serviços"])
     ativos_trans["Servico_Porta"] = limpar_texto(ativos_trans["Serviços"])
+    ativos_ip = manter_so_designacoes_validas(ativos_ip, "Servico_Porta", "Ativos IP")
+    ativos_trans = manter_so_designacoes_validas(ativos_trans, "Servico_Porta", "Ativos Transporte")
 
     ativos_ip["Servico"] = ativos_ip["Servico_Porta"].apply(montar_chave_servico)
     ativos_trans["Servico"] = ativos_trans["Servico_Porta"].apply(montar_chave_servico)
@@ -291,11 +336,13 @@ def preparar_bases():
         Capacidade_IP=("Capacidade_IP", "sum"),
         Qtd_Portas_IP=("Servico_Porta", "count"),
         Detalhe_Portas_IP=("Detalhe_Porta_IP", lambda s: " | ".join(s)),
+        Cliente_IP=("Clientes", "first"),
     )
     ativos_trans = ativos_trans.groupby("Servico", as_index=False).agg(
         Capacidade_Trans=("Capacidade_Trans", "sum"),
         Qtd_Portas_Trans=("Servico_Porta", "count"),
         Detalhe_Portas_Trans=("Detalhe_Porta_Trans", lambda s: " | ".join(s)),
+        Cliente_Trans=("Clientes", "first"),
     )
 
     # =============================
@@ -304,6 +351,7 @@ def preparar_bases():
 
     sites = sites[["Nome Serviço"]].copy()
     sites["Servico"] = limpar_texto(sites["Nome Serviço"])
+    sites = manter_so_designacoes_validas(sites, "Servico", "Sites")
     sites = sites.drop_duplicates(subset="Servico", keep="first")
 
     return dici, ativos_ip, ativos_trans, sites
@@ -317,12 +365,12 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
     """
 
     # --- Base DICI reduzida para o merge ---
-    dici_m = dici[["Servico", "NmServico", "Tipo", "Velocidade_Gb"]].rename(
-        columns={"NmServico": "Nome_XCONN"}
+    dici_m = dici[["Servico", "NmServico", "nmempresa", "Tipo", "Velocidade_Gb"]].rename(
+        columns={"NmServico": "Nome_XCONN", "nmempresa": "Cliente_XCONN"}
     )
 
-    ativos_ip_m = ativos_ip[["Servico", "Capacidade_IP", "Qtd_Portas_IP", "Detalhe_Portas_IP"]]
-    ativos_trans_m = ativos_trans[["Servico", "Capacidade_Trans", "Qtd_Portas_Trans", "Detalhe_Portas_Trans"]]
+    ativos_ip_m = ativos_ip[["Servico", "Capacidade_IP", "Qtd_Portas_IP", "Detalhe_Portas_IP", "Cliente_IP"]]
+    ativos_trans_m = ativos_trans[["Servico", "Capacidade_Trans", "Qtd_Portas_Trans", "Detalhe_Portas_Trans", "Cliente_Trans"]]
     sites_m = sites[["Servico"]].assign(Existe_Sites=True)
 
     # --- Outer join de todas as bases pelo código normalizado do serviço ---
@@ -338,6 +386,30 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
 
     # --- Nome de exibição: usa o nome do XCONN quando existir, senão o código normalizado ---
     base["Servico_Exibicao"] = base["Nome_XCONN"].fillna(base["Servico"])
+
+    # --- Cliente: nome da empresa no XCONN; senão o nome da planilha de Ativos;
+    # senão o código do cliente na designação (Trecho/CLIENTE/Tecnologia/Porta) ---
+    def limpar_cliente(serie):
+        serie = serie.astype("string").str.strip()
+        return serie.mask(serie == "")
+
+    codigo_cliente = base["Servico"].str.split("/").str[1]
+    base["Cliente"] = (
+        limpar_cliente(base["Cliente_XCONN"])
+        .fillna(limpar_cliente(base["Cliente_IP"]))
+        .fillna(limpar_cliente(base["Cliente_Trans"]))
+        .fillna(codigo_cliente)
+        .fillna("")
+    )
+    # O mesmo cliente pode vir com grafias diferentes entre as bases
+    # (ex.: "MAXXNET" x "Maxxnet"): unifica pela grafia mais frequente.
+    chave_cliente = base["Cliente"].apply(normalizar_texto)
+    grafia_preferida = (
+        base.assign(Chave_Cliente=chave_cliente)
+        .groupby("Chave_Cliente")["Cliente"]
+        .agg(lambda s: s.value_counts().index[0])
+    )
+    base["Cliente"] = chave_cliente.map(grafia_preferida)
 
     # --- Filtro: desconsidera serviços com algum dos nomes de FILTROS_SUBSTRING_IGNORAR ou nome muito curto ---
     nome_upper = base["Servico_Exibicao"].astype(str).str.upper()
@@ -405,7 +477,7 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
                 divergencias.append("Capacidade divergente entre XCONN e Ativos")
 
         if not row["Existe_Sites"]:
-            divergencias.append("Não encontrado em Sites")
+            divergencias.append(STATUS_NAO_ENCONTRADO_SITES)
 
         if not divergencias:
             return "OK"
@@ -458,6 +530,7 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
 
     resultado = base[[
         "Servico_Exibicao",
+        "Cliente",
         "Tipo",
         "Existe_XCONN",
         "Existe_Ativos_IP",
@@ -493,6 +566,13 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
     return resultado
 
 
+def filtrar_nao_encontrados_em_sites(df):
+    """Devolve só os serviços cujo Status contém "Não encontrado em Sites"
+    (sozinho ou junto com outras divergências separadas por "; ")."""
+    mask = df["Status"].str.contains(STATUS_NAO_ENCONTRADO_SITES, regex=False, na=False)
+    return df[mask].copy()
+
+
 COR_FUNDO_CABECALHO = "1F497D"
 COR_FONTE_CABECALHO = "F79646"
 
@@ -508,6 +588,22 @@ def estilizar_cabecalho(worksheet):
         celula.font = fonte
 
 
+def ranking_clientes(df):
+    """Clientes ordenados pela quantidade de serviços desincronizados (maior primeiro)."""
+    agrupado = (
+        df.assign(Divergente=df["Status"] != "OK")
+        .groupby("Cliente", as_index=False)
+        .agg(Servicos_Divergentes=("Divergente", "sum"), Total_Servicos=("Servico", "count"))
+    )
+    agrupado["Percentual_Divergente"] = (
+        agrupado["Servicos_Divergentes"] / agrupado["Total_Servicos"] * 100
+    ).round(1)
+    return agrupado.sort_values(
+        by=["Servicos_Divergentes", "Percentual_Divergente", "Cliente"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+
 def gerar_relatorio(df):
     total = len(df)
     divergentes_mask = df["Status"] != "OK"
@@ -520,7 +616,7 @@ def gerar_relatorio(df):
 
     # Divergencias: resumida, só com o essencial (serviço, tipo, motivo, último TAS)
     df_divergentes = (
-        df[divergentes_mask][["Servico", "Tipo", "Status", "Ultimo_TAS"]]
+        df[divergentes_mask][["Servico", "Cliente", "Tipo", "Status", "Ultimo_TAS"]]
         .rename(columns={"Status": "Motivo_Divergencia"})
         .reset_index(drop=True)
     )
@@ -528,12 +624,15 @@ def gerar_relatorio(df):
     # Divergencia_Detalhada: mesmas linhas divergentes, mas com todas as colunas
     df_divergentes_detalhado = df[divergentes_mask].reset_index(drop=True)
 
+    df_clientes = ranking_clientes(df)
+
     with pd.ExcelWriter(RELATORIO_SAIDA, engine="openpyxl") as writer:
         df_divergentes.to_excel(writer, sheet_name="Divergencias", index=False)
         df_divergentes_detalhado.to_excel(writer, sheet_name="Divergencia_Detalhada", index=False)
+        df_clientes.to_excel(writer, sheet_name="Clientes", index=False)
         resumo.to_excel(writer, sheet_name="Resumo", index=False)
 
-        for nome_aba in ["Divergencias", "Divergencia_Detalhada", "Resumo"]:
+        for nome_aba in ["Divergencias", "Divergencia_Detalhada", "Clientes", "Resumo"]:
             estilizar_cabecalho(writer.sheets[nome_aba])
 
     logger.info(f"Relatório gerado: {RELATORIO_SAIDA} ({divergentes}/{total} divergências)")
@@ -549,7 +648,7 @@ def gerar_dashboard_html(df):
     divergentes = int((df["Status"] != "OK").sum())
     ok = total - divergentes
 
-    colunas_exibicao = ["Servico", "Tipo", "Status", "Gb_XCONN"]
+    colunas_exibicao = ["Servico", "Cliente", "Tipo", "Status", "Gb_XCONN"]
     if "Gb_Ativos_IP_Total" in df.columns:
         colunas_exibicao.append("Gb_Ativos_IP_Total")
     if "Gb_Ativos_Transporte_Total" in df.columns:
@@ -654,6 +753,26 @@ def gerar_dashboard_html(df):
     }}
     .badge-ok {{ background: #c8e6c9; color: var(--verde); }}
     .badge-divergente {{ background: #ffcdd2; color: var(--vermelho); }}
+    .painel-clientes {{
+        background: white; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+    }}
+    .painel-clientes summary {{
+        cursor: pointer; font-weight: 600; color: var(--azul); font-size: 15px;
+    }}
+    .painel-clientes .dica {{ color: #666; font-size: 12px; margin: 6px 0 10px; }}
+    .lista-clientes {{ max-height: 320px; overflow-y: auto; }}
+    .item-cliente {{
+        display: grid; grid-template-columns: minmax(120px, 260px) 1fr auto;
+        gap: 12px; align-items: center; padding: 5px 6px; border-radius: 4px;
+        cursor: pointer; font-size: 13px;
+    }}
+    .item-cliente:hover {{ background: #eef2f7; }}
+    .item-cliente.ativo {{ background: #dce6f2; font-weight: 600; }}
+    .item-cliente .nome {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .item-cliente .barra {{ background: #eee; border-radius: 3px; height: 10px; overflow: hidden; }}
+    .item-cliente .barra div {{ background: var(--vermelho); height: 100%; }}
+    .item-cliente .numeros {{ color: #555; white-space: nowrap; font-variant-numeric: tabular-nums; }}
     .contagem {{ color: #666; font-size: 13px; margin-top: 8px; }}
     .sem-resultado {{ text-align: center; padding: 30px; color: #888; }}
 </style>
@@ -674,6 +793,12 @@ def gerar_dashboard_html(df):
     <div class="card divergente"><div class="numero">{divergentes}</div><div class="rotulo">Precisam sincronizar</div></div>
 </div>
 
+<details class="painel-clientes" open>
+    <summary>Clientes mais desincronizados</summary>
+    <p class="dica">Ordenado pela quantidade de serviços com divergência (respeita o filtro de setor). Clique num cliente para filtrar a tabela; clique de novo para limpar.</p>
+    <div class="lista-clientes" id="listaClientes"></div>
+</details>
+
 <div class="barra-fixa">
     <div class="setores">
         <button type="button" class="btn-setor" data-tipo="todos">Todos os setores</button>
@@ -687,10 +812,14 @@ def gerar_dashboard_html(df):
             <option value="divergente">Só divergentes</option>
             <option value="todos">Todos</option>
             <option value="ok">Só OK</option>
+            <option value="nao_sites">Só não encontrados em Sites</option>
         </select>
         <select id="filtroTipo">
             <option value="todos">Todos os tipos</option>
             {opcoes_tipo}
+        </select>
+        <select id="filtroCliente">
+            <option value="todos">Todos os clientes</option>
         </select>
     </div>
 </div>
@@ -699,6 +828,7 @@ def gerar_dashboard_html(df):
     <thead>
         <tr>
             <th data-col="Servico">Serviço<span class="seta-ordenacao"></span></th>
+            <th data-col="Cliente">Cliente<span class="seta-ordenacao"></span></th>
             <th data-col="Tipo">Tipo<span class="seta-ordenacao"></span></th>
             <th data-col="Status">Status<span class="seta-ordenacao"></span></th>
             <th data-col="Gb_XCONN">Gb XCONN<span class="seta-ordenacao"></span></th>
@@ -715,19 +845,84 @@ def gerar_dashboard_html(df):
 
 <script>
     const dados = {dados_json};
+    const STATUS_NAO_SITES = {json.dumps(STATUS_NAO_ENCONTRADO_SITES, ensure_ascii=False)};
     let ordenacaoAtual = {{ coluna: null, asc: true }};
+
+    function escaparHtml(texto) {{
+        return String(texto).replace(/[&<>"']/g, function(c) {{
+            return {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }}[c];
+        }});
+    }}
+
+    // Clientes ordenados por nº de serviços desincronizados (maior primeiro),
+    // considerando só o setor selecionado.
+    function calcularRankingClientes() {{
+        const filtroTipo = document.getElementById('filtroTipo').value;
+        const porCliente = {{}};
+        dados.forEach(function(linha) {{
+            if (filtroTipo !== 'todos' && linha.Tipo !== filtroTipo) return;
+            const nome = linha.Cliente || '(sem cliente)';
+            if (!porCliente[nome]) porCliente[nome] = {{ nome: nome, divergentes: 0, total: 0 }};
+            porCliente[nome].total++;
+            if (linha.Status !== 'OK') porCliente[nome].divergentes++;
+        }});
+        return Object.values(porCliente).sort(function(a, b) {{
+            return (b.divergentes - a.divergentes)
+                || (b.divergentes / b.total - a.divergentes / a.total)
+                || a.nome.localeCompare(b.nome);
+        }});
+    }}
+
+    function renderizarClientes() {{
+        const ranking = calcularRankingClientes();
+        const selecionado = document.getElementById('filtroCliente').value;
+
+        // Dropdown: mesma ordem do ranking, com a contagem de divergências
+        const select = document.getElementById('filtroCliente');
+        select.innerHTML = '<option value="todos">Todos os clientes</option>' + ranking.map(function(c) {{
+            return '<option value="' + escaparHtml(c.nome) + '">' + escaparHtml(c.nome) +
+                ' (' + c.divergentes + ' desinc.)</option>';
+        }}).join('');
+        select.value = ranking.some(function(c) {{ return c.nome === selecionado; }}) ? selecionado : 'todos';
+
+        // Painel: só quem tem algo pra sincronizar
+        const comDivergencia = ranking.filter(function(c) {{ return c.divergentes > 0; }});
+        const maximo = comDivergencia.length ? comDivergencia[0].divergentes : 1;
+        const lista = document.getElementById('listaClientes');
+        lista.innerHTML = comDivergencia.length ? '' : '<p class="dica">Nenhum cliente com divergência.</p>';
+        comDivergencia.forEach(function(c) {{
+            const item = document.createElement('div');
+            item.className = 'item-cliente' + (select.value === c.nome ? ' ativo' : '');
+            item.title = c.nome;
+            item.innerHTML =
+                '<span class="nome">' + escaparHtml(c.nome) + '</span>' +
+                '<div class="barra"><div style="width:' + (c.divergentes / maximo * 100) + '%"></div></div>' +
+                '<span class="numeros">' + c.divergentes + ' de ' + c.total +
+                ' (' + Math.round(c.divergentes / c.total * 100) + '%)</span>';
+            item.addEventListener('click', function() {{
+                select.value = select.value === c.nome ? 'todos' : c.nome;
+                renderizarClientes();
+                renderizar();
+            }});
+            lista.appendChild(item);
+        }});
+    }}
 
     function renderizar() {{
         const busca = document.getElementById('busca').value.trim().toUpperCase();
         const filtroStatus = document.getElementById('filtroStatus').value;
         const filtroTipo = document.getElementById('filtroTipo').value;
+        const filtroCliente = document.getElementById('filtroCliente').value;
 
         let linhas = dados.filter(function(linha) {{
             const ehOk = linha.Status === 'OK';
             if (filtroStatus === 'divergente' && ehOk) return false;
             if (filtroStatus === 'ok' && !ehOk) return false;
+            if (filtroStatus === 'nao_sites' && !String(linha.Status).includes(STATUS_NAO_SITES)) return false;
             if (filtroTipo !== 'todos' && linha.Tipo !== filtroTipo) return false;
-            if (busca && !String(linha.Servico).toUpperCase().includes(busca)) return false;
+            if (filtroCliente !== 'todos' && (linha.Cliente || '(sem cliente)') !== filtroCliente) return false;
+            if (busca && !String(linha.Servico).toUpperCase().includes(busca)
+                && !String(linha.Cliente).toUpperCase().includes(busca)) return false;
             return true;
         }});
 
@@ -754,6 +949,7 @@ def gerar_dashboard_html(df):
                 : '<span class="badge badge-divergente">' + linha.Status + '</span>';
             tr.innerHTML =
                 '<td>' + linha.Servico + '</td>' +
+                '<td>' + escaparHtml(linha.Cliente || '') + '</td>' +
                 '<td>' + linha.Tipo + '</td>' +
                 '<td>' + badge + '</td>' +
                 '<td>' + linha.Gb_XCONN + '</td>' +
@@ -778,6 +974,7 @@ def gerar_dashboard_html(df):
         btn.addEventListener('click', function() {{
             document.getElementById('filtroTipo').value = btn.getAttribute('data-tipo');
             atualizarBotoesSetor();
+            renderizarClientes();
             renderizar();
         }});
     }});
@@ -816,11 +1013,17 @@ def gerar_dashboard_html(df):
     document.getElementById('filtroStatus').addEventListener('change', renderizar);
     document.getElementById('filtroTipo').addEventListener('change', function() {{
         atualizarBotoesSetor();
+        renderizarClientes();
+        renderizar();
+    }});
+    document.getElementById('filtroCliente').addEventListener('change', function() {{
+        renderizarClientes();
         renderizar();
     }});
 
     atualizarBotoesSetor();
     atualizarSetasOrdenacao();
+    renderizarClientes();
     renderizar();
 </script>
 </body>
@@ -846,27 +1049,237 @@ def gerar_dashboard_html(df):
             logger.warning(f"Não foi possível abrir o dashboard automaticamente: {e}")
 
 
-def enviar_email_com_relatorio(arquivo_anexo, arquivo_dashboard=None):
+def resumo_para_email(df):
+    """Números usados no corpo do e-mail (HTML e texto puro)."""
+    divergentes = df[df["Status"] != "OK"]
+    motivos = (
+        divergentes["Status"].str.split("; ").explode().value_counts()
+    )
+    setores = []
+    for tipo, rotulo in [("IP", "IP"), ("TRANSPORTE", "Transporte")]:
+        do_tipo = df[df["Tipo"] == tipo]
+        setores.append((rotulo, int((do_tipo["Status"] != "OK").sum()), len(do_tipo)))
+    ranking = ranking_clientes(df)
+    return {
+        "total": len(df),
+        "divergentes": len(divergentes),
+        "ok": len(df) - len(divergentes),
+        "motivos": list(motivos.items())[:EMAIL_QTD_MOTIVOS],
+        "setores": setores,
+        "clientes": ranking[ranking["Servicos_Divergentes"] > 0].head(EMAIL_QTD_CLIENTES),
+        "qtd_clientes_afetados": int((ranking["Servicos_Divergentes"] > 0).sum()),
+    }
+
+
+def gerar_email_texto(resumo):
+    """Versão em texto puro, para clientes de e-mail que não exibem HTML."""
+    linhas = [
+        "Olá,",
+        "",
+        f"Resultado da comparação de bases de {datetime.now().strftime('%d/%m/%Y')}:",
+        f"  - Serviços analisados: {resumo['total']}",
+        f"  - OK: {resumo['ok']}",
+        f"  - Precisam sincronizar: {resumo['divergentes']}",
+        "",
+        "Clientes mais desincronizados:",
+    ]
+    for _, c in resumo["clientes"].iterrows():
+        linhas.append(f"  - {c['Cliente']}: {c['Servicos_Divergentes']} de {c['Total_Servicos']}")
+    if DASHBOARD_URL:
+        linhas += ["", f"Dashboard interativo: {DASHBOARD_URL}"]
+    linhas += ["", "O relatório completo segue em anexo (Excel)."]
+    return "\n".join(linhas)
+
+
+def gerar_email_html(resumo, logo_cid=None):
+    """
+    Corpo do e-mail em HTML. Feito com tabelas e estilos inline (sem
+    JavaScript, grid ou <style> complexo) porque é o que o Outlook respeita.
+    """
+    esc = html_lib.escape
+    azul, laranja = f"#{COR_FUNDO_CABECALHO}", f"#{COR_FONTE_CABECALHO}"
+    verde, vermelho, cinza = "#2e7d32", "#c62828", "#666666"
+    fonte = "font-family:Segoe UI,Arial,sans-serif;"
+    total = resumo["total"] or 1
+    pct_div = round(resumo["divergentes"] / total * 100, 1)
+
+    logo = (
+        f'<img src="cid:{logo_cid}" width="110" height="56" alt="Eletronet" '
+        f'style="display:block;border:0;">' if logo_cid else ""
+    )
+
+    def card(numero, rotulo, cor, detalhe=""):
+        return (
+            f'<td width="33%" valign="top" style="padding:0 6px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="background:#ffffff;border:1px solid #e3e7ec;border-top:4px solid {cor};">'
+            f'<tr><td style="padding:14px 16px;{fonte}">'
+            f'<div style="font-size:28px;font-weight:bold;color:{cor};">{numero}</div>'
+            f'<div style="font-size:13px;color:{cinza};">{rotulo}</div>'
+            f'<div style="font-size:12px;color:{cinza};">{detalhe}&nbsp;</div>'
+            f'</td></tr></table></td>'
+        )
+
+    def titulo_secao(texto):
+        return (
+            f'<tr><td style="padding:24px 24px 8px;{fonte}font-size:16px;font-weight:bold;'
+            f'color:{azul};">{texto}</td></tr>'
+        )
+
+    def barra(valor, maximo, cor):
+        largura = max(int(round(valor / (maximo or 1) * 100)), 2)
+        return (
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="background:#eeeeee;"><tr>'
+            f'<td width="{largura}%" height="10" style="background:{cor};font-size:0;line-height:0;">&nbsp;</td>'
+            + (f'<td style="font-size:0;line-height:0;">&nbsp;</td>' if largura < 100 else "")
+            + "</tr></table>"
+        )
+
+    setores_html = " &nbsp;·&nbsp; ".join(
+        f"{rotulo}: <b>{div}</b> de {tot}" for rotulo, div, tot in resumo["setores"]
+    )
+
+    # Clientes mais desincronizados
+    linhas_clientes = ""
+    max_cli = int(resumo["clientes"]["Servicos_Divergentes"].max()) if len(resumo["clientes"]) else 1
+    for i, (_, c) in enumerate(resumo["clientes"].iterrows()):
+        fundo = "#ffffff" if i % 2 == 0 else "#f7f9fb"
+        linhas_clientes += (
+            f'<tr style="background:{fundo};">'
+            f'<td style="padding:7px 10px;{fonte}font-size:13px;color:#222;">{esc(str(c["Cliente"]))}</td>'
+            f'<td width="35%" style="padding:7px 10px;">{barra(c["Servicos_Divergentes"], max_cli, vermelho)}</td>'
+            f'<td align="right" style="padding:7px 10px;{fonte}font-size:13px;color:#444;white-space:nowrap;">'
+            f'<b>{int(c["Servicos_Divergentes"])}</b> de {int(c["Total_Servicos"])}</td></tr>'
+        )
+    if not linhas_clientes:
+        linhas_clientes = (
+            f'<tr><td style="padding:10px;{fonte}font-size:13px;color:{verde};">'
+            f'Nenhum cliente com divergência. 🎉</td></tr>'
+        )
+
+    # Principais motivos de divergência
+    linhas_motivos = ""
+    max_mot = resumo["motivos"][0][1] if resumo["motivos"] else 1
+    for i, (motivo, qtd) in enumerate(resumo["motivos"]):
+        fundo = "#ffffff" if i % 2 == 0 else "#f7f9fb"
+        linhas_motivos += (
+            f'<tr style="background:{fundo};">'
+            f'<td style="padding:7px 10px;{fonte}font-size:13px;color:#222;">{esc(motivo)}</td>'
+            f'<td width="30%" style="padding:7px 10px;">{barra(qtd, max_mot, laranja)}</td>'
+            f'<td align="right" style="padding:7px 10px;{fonte}font-size:13px;color:#444;"><b>{qtd}</b></td></tr>'
+        )
+
+    botao = ""
+    if DASHBOARD_URL:
+        botao = (
+            f'<tr><td align="center" style="padding:24px;">'
+            f'<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
+            f'<td style="background:{azul};border-radius:6px;">'
+            f'<a href="{esc(DASHBOARD_URL)}" style="display:inline-block;padding:12px 28px;{fonte}'
+            f'font-size:14px;font-weight:bold;color:#ffffff;text-decoration:none;">'
+            f'Abrir dashboard interativo</a></td></tr></table>'
+            f'<div style="{fonte}font-size:11px;color:{cinza};padding-top:6px;">'
+            f'Funciona na rede interna da Eletronet.</div></td></tr>'
+        )
+
+    if resumo["divergentes"]:
+        frase_resumo = (
+            f'<b style="color:{vermelho};">{resumo["divergentes"]} serviço(s)</b> de '
+            f'{resumo["qtd_clientes_afetados"]} cliente(s) precisam ser sincronizados.'
+        )
+    else:
+        frase_resumo = f'<b style="color:{verde};">todas as bases estão sincronizadas.</b>'
+
+    tabela = (
+        'role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="border:1px solid #e3e7ec;border-collapse:collapse;"'
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f6f8;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;">
+<tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="width:100%;max-width:640px;background:#ffffff;border:1px solid #e3e7ec;">
+
+{f'<tr><td style="padding:16px 24px 12px;">{logo}</td></tr>' if logo else ''}
+<tr><td style="background:{azul};padding:18px 24px;border-bottom:4px solid {laranja};{fonte}">
+    <div style="font-size:20px;font-weight:bold;color:#ffffff;">Relatório de Divergências</div>
+    <div style="font-size:13px;color:{laranja};padding-top:4px;">
+        Comparação XCONN × Ativos × Sites · {datetime.now().strftime('%d/%m/%Y')}</div>
+</td></tr>
+
+<tr><td style="padding:22px 24px 6px;{fonte}font-size:14px;color:#333;line-height:1.5;">
+    Olá,<br>
+    Segue o resultado da comparação desta semana: {frase_resumo}
+</td></tr>
+
+<tr><td style="padding:12px 18px 0;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+        {card(resumo['total'], 'Serviços analisados', azul)}
+        {card(resumo['ok'], 'OK', verde)}
+        {card(resumo['divergentes'], 'Precisam sincronizar', vermelho, f'{pct_div}% do total')}
+    </tr></table>
+</td></tr>
+<tr><td style="padding:10px 24px 0;{fonte}font-size:12px;color:{cinza};">Divergências por setor: {setores_html}</td></tr>
+
+{titulo_secao('Clientes mais desincronizados')}
+<tr><td style="padding:0 24px;"><table {tabela}>{linhas_clientes}</table></td></tr>
+
+{titulo_secao('Principais motivos') if linhas_motivos else ''}
+{f'<tr><td style="padding:0 24px;"><table {tabela}>{linhas_motivos}</table></td></tr>' if linhas_motivos else ''}
+
+{botao or '<tr><td style="padding:12px;"></td></tr>'}
+
+<tr><td style="padding:0 24px 22px;{fonte}font-size:13px;color:#333;">
+    📎 A lista completa, com o detalhamento de cada serviço, está na planilha em anexo.
+</td></tr>
+
+<tr><td style="background:#f4f6f8;padding:14px 24px;{fonte}font-size:11px;color:#888;border-top:1px solid #e3e7ec;">
+    E-mail gerado automaticamente pela automação de comparação de bases. Não é necessário responder.
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+
+def enviar_email_com_relatorio(resultado, arquivo_anexo):
     if not ENVIAR_EMAIL:
         logger.info("Envio de e-mail desabilitado nas configurações.")
         return
 
     logger.info("Preparando envio de e-mail...")
 
+    resumo = resumo_para_email(resultado)
+
     msg = EmailMessage()
-    msg["Subject"] = f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')}"
+    msg["Subject"] = (
+        f"Relatório de Divergências - {datetime.now().strftime('%d/%m/%Y')} "
+        f"({resumo['divergentes']} para sincronizar)"
+    )
     msg["From"] = EMAIL_REMETENTE
     msg["To"] = EMAIL_DESTINATARIO
-    msg.set_content("Olá,\n\nSegue em anexo o relatório de divergências gerado pela automação. "
-                     "Seu cliente de e-mail não exibiu a versão em HTML deste e-mail.")
+    msg.set_content(gerar_email_texto(resumo))
 
-    if arquivo_dashboard:
-        try:
-            with open(arquivo_dashboard, "r", encoding="utf-8") as f:
-                dashboard_html = f.read()
-            msg.add_alternative(dashboard_html, subtype="html")
-        except Exception as e:
-            logger.warning(f"Não foi possível anexar o dashboard em HTML ao corpo do e-mail: {e}")
+    # Logo vai como imagem inline (cid:), que o Outlook exibe; data URI ele bloqueia.
+    logo_bytes = None
+    try:
+        with open(LOGO_EMAIL_ARQUIVO, "rb") as f:
+            logo_bytes = f.read()
+    except Exception as e:
+        logger.warning(f"Não foi possível carregar o logo do e-mail ({LOGO_EMAIL_ARQUIVO}): {e}")
+
+    logo_cid = make_msgid(domain="eletronet.local")[1:-1] if logo_bytes else None
+    msg.add_alternative(gerar_email_html(resumo, logo_cid), subtype="html")
+    if logo_bytes:
+        msg.get_payload()[1].add_related(
+            logo_bytes, maintype="image", subtype="jpeg", cid=f"<{logo_cid}>"
+        )
 
     try:
         with open(arquivo_anexo, "rb") as f:
@@ -898,7 +1311,7 @@ def main():
     gerar_relatorio(resultado)
     gerar_dashboard_html(resultado)
 
-    enviar_email_com_relatorio(RELATORIO_SAIDA, DASHBOARD_SAIDA)
+    enviar_email_com_relatorio(resultado, RELATORIO_SAIDA)
 
     logger.info("Finalizado.")
 
