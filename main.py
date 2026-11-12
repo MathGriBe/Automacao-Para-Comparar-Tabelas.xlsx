@@ -164,6 +164,23 @@ def classificar_tecnologia(tecnologia):
     return "OUTROS"
 
 
+def classificar_por_sigla(servico):
+    """
+    Deduz o tipo pela sigla de tecnologia da designação
+    (Trecho/Cliente/SIGLA/Porta): GETH -> TRANSPORTE; IPFL, IPOB, IPOP,
+    IPTB, IPTT... -> IP. Sigla desconhecida fica sem tipo (pd.NA).
+    """
+    partes = str(servico).split("/")
+    if len(partes) < 3:
+        return pd.NA
+    sigla = partes[2].upper()
+    if sigla == "GETH":
+        return "TRANSPORTE"
+    if sigla.startswith("IP"):
+        return "IP"
+    return pd.NA
+
+
 def ler_arquivo_excel(caminho, sheet_name, header=None):
     if header is None:
         return pd.read_excel(caminho, sheet_name=sheet_name)
@@ -384,6 +401,18 @@ def comparar_bases(dici, ativos_ip, ativos_trans, sites):
     base["Existe_Ativos_IP"] = base["Capacidade_IP"].notna()
     base["Existe_Ativos_Transporte"] = base["Capacidade_Trans"].notna()
     base["Existe_Sites"] = base["Existe_Sites"].fillna(False)
+
+    # --- Tipo de quem não está no XCONN: o XCONN é a única fonte de NmTecnologia,
+    # então sem isso esses serviços ficavam com Tipo vazio. Deduz primeiro pela
+    # aba de Ativos onde o serviço aparece; se aparecer em nenhuma (ou nas duas),
+    # pela sigla da designação (Trecho/Cliente/SIGLA/Porta). ---
+    sem_tipo = base["Tipo"].isna()
+    so_ip = base["Existe_Ativos_IP"] & ~base["Existe_Ativos_Transporte"]
+    so_trans = base["Existe_Ativos_Transporte"] & ~base["Existe_Ativos_IP"]
+    base.loc[sem_tipo & so_ip, "Tipo"] = "IP"
+    base.loc[sem_tipo & so_trans, "Tipo"] = "TRANSPORTE"
+    sem_tipo = base["Tipo"].isna()
+    base.loc[sem_tipo, "Tipo"] = base.loc[sem_tipo, "Servico"].apply(classificar_por_sigla)
 
     # --- Nome de exibição: usa o nome do XCONN quando existir, senão o código normalizado ---
     base["Servico_Exibicao"] = base["Nome_XCONN"].fillna(base["Servico"])

@@ -210,6 +210,12 @@ Principais colunas: `Servico`, `Cliente`, `Tipo` (IP/TRANSPORTE/OUTROS), `Status
 - `IP`: IP Flat, IP no PIX, IP no POP, IP Conteudo e variacoes Burstable/Brasil
 - qualquer outra tecnologia vira `OUTROS` (e gera divergencia)
 
+Servico que nao esta no XCONN nao tem `NmTecnologia`, entao o tipo e deduzido nesta ordem:
+
+1. pela aba de Ativos onde ele aparece: so na aba IP vira `IP`, so na aba Transporte vira `TRANSPORTE`
+2. se nao aparece em nenhuma aba (ou aparece nas duas), pela sigla da designacao (funcao `classificar_por_sigla`): `GETH` vira `TRANSPORTE`; `IPxx` (IPFL, IPOB, IPOP, IPTB, IPTT) vira `IP`
+3. sigla fora desses padroes (ex.: `POP`) fica com Tipo vazio
+
 **Divergencias possiveis no Status** (podem aparecer varias juntas, separadas por `; `)
 
 | Divergencia | Quando acontece |
